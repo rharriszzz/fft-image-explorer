@@ -1,0 +1,6 @@
+numpy
+Pillow
+matplotlib
+
+# Optional: enable HEIC/HEIF image support
+# pillow-heif
