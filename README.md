@@ -37,7 +37,7 @@ python fft_image_explorer.py path/to/image.jpg
 Copy/paste launch command:
 
 ```bash
-/home/rharris/git/fft-image-explorer/.venv/bin/python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
+~/git/fft-image-explorer/.venv/bin/python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
 ```
 
 Example with your image:
@@ -49,7 +49,7 @@ python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
 If you are using the project virtual environment directly:
 
 ```bash
-/home/rharris/git/fft-image-explorer/.venv/bin/python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
+~/git/fft-image-explorer/.venv/bin/python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
 ```
 
 ## Dependencies
