@@ -49,7 +49,7 @@ python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
 If you are using the project virtual environment directly:
 
 ```bash
-~/git/fft-image-explorer/.venv/bin/python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
+~/git/fft-image-explorer/.venv/bin/python fft_image_explorer.py ~/git/beads/beads-photo-2.jpg
 ```
 
 ## Dependencies

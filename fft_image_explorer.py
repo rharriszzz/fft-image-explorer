@@ -347,6 +347,177 @@ def crop_to_mask_nonzero(xm: np.ndarray, mask: np.ndarray, eps: float = 1e-6) ->
     return xm[y0:y1, x0:x1].astype(np.float32)
 
 
+def find_top_fft_peaks(logmag: np.ndarray, top_k: int = 5, min_distance: int = 6) -> list[dict[str, float]]:
+    """Find the strongest local maxima in a 2D log-magnitude FFT image, merging conjugate pairs."""
+    h, w = logmag.shape
+    cy, cx = h // 2, w // 2
+
+    def canonical_offset(yy: int, xx: int) -> tuple[int, int]:
+        dx = int(xx - cx)
+        dy = int(cy - yy)
+        if dy < 0 or (dy == 0 and dx < 0):
+            dx = -dx
+            dy = -dy
+        return dx, dy
+
+    def peak_region_stats(yy: int, xx: int) -> dict[str, float]:
+        peak_val = float(logmag[yy, xx])
+        radius = 8
+        y0 = max(0, yy - radius)
+        y1 = min(h, yy + radius + 1)
+        x0 = max(0, xx - radius)
+        x1 = min(w, xx + radius + 1)
+        patch = logmag[y0:y1, x0:x1]
+        py, px = np.mgrid[y0:y1, x0:x1]
+
+        support = patch >= max(0.5 * peak_val, 1e-9)
+        if not np.any(support):
+            support = patch > 0
+
+        weights = patch[support]
+        dx_support = px[support] - xx
+        dy_support = yy - py[support]
+        dist2 = dx_support ** 2 + dy_support ** 2
+        broadness = float(np.sqrt((weights * dist2).sum() / max(weights.sum(), 1e-12)))
+        log_power_sum = float(weights.sum())
+        radius_support = np.sqrt(dist2)
+
+        # Track the flat-top region (pixels equal to the local max) to compare
+        # against what the detail popup shows as a uniform bright disk.
+        plateau = patch >= (peak_val - 1e-12)
+        if np.any(plateau):
+            dx_plateau = px[plateau] - xx
+            dy_plateau = yy - py[plateau]
+            dist2_plateau = dx_plateau ** 2 + dy_plateau ** 2
+            radius_plateau = np.sqrt(dist2_plateau)
+            plateau_count = int(plateau.sum())
+            plateau_rmax = float(radius_plateau.max())
+            plateau_dx_min = float(dx_plateau.min())
+            plateau_dx_max = float(dx_plateau.max())
+            plateau_dy_min = float(dy_plateau.min())
+            plateau_dy_max = float(dy_plateau.max())
+        else:
+            plateau_count = 0
+            plateau_rmax = 0.0
+            plateau_dx_min = 0.0
+            plateau_dx_max = 0.0
+            plateau_dy_min = 0.0
+            plateau_dy_max = 0.0
+
+        threshold = float(max(0.5 * peak_val, 1e-9))
+        return {
+            "peak_val": peak_val,
+            "support_threshold": threshold,
+            "log_power_sum": log_power_sum,
+            "broadness": broadness,
+            "support_count": float(support.sum()),
+            "support_rmax": float(radius_support.max()) if radius_support.size else 0.0,
+            "support_rms_unweighted": float(np.sqrt(dist2.mean())) if dist2.size else 0.0,
+            "support_dx_min": float(dx_support.min()) if dx_support.size else 0.0,
+            "support_dx_max": float(dx_support.max()) if dx_support.size else 0.0,
+            "support_dy_min": float(dy_support.min()) if dy_support.size else 0.0,
+            "support_dy_max": float(dy_support.max()) if dy_support.size else 0.0,
+            "plateau_count": float(plateau_count),
+            "plateau_rmax": plateau_rmax,
+            "plateau_dx_min": plateau_dx_min,
+            "plateau_dx_max": plateau_dx_max,
+            "plateau_dy_min": plateau_dy_min,
+            "plateau_dy_max": plateau_dy_max,
+        }
+
+    # Simple 3x3 local-maximum test without extra dependencies.
+    padded = np.pad(logmag, 1, mode="constant", constant_values=-np.inf)
+    local_max = np.ones((h, w), dtype=bool)
+    for oy in (-1, 0, 1):
+        for ox in (-1, 0, 1):
+            if oy == 0 and ox == 0:
+                continue
+            neigh = padded[1 + oy:1 + oy + h, 1 + ox:1 + ox + w]
+            local_max &= logmag >= neigh
+
+    candidates = np.argwhere(local_max & (logmag > 0))
+    if candidates.size == 0:
+        candidates = np.array([[cy, cx]])
+
+    values = logmag[candidates[:, 0], candidates[:, 1]]
+    order = np.argsort(values)[::-1]
+    candidates = candidates[order]
+
+    selected: list[tuple[int, int]] = [(cy, cx)]
+    selected_keys: set[tuple[int, int]] = {canonical_offset(cy, cx)}
+
+    for yy, xx in candidates:
+        if len(selected) >= top_k:
+            break
+        yy_i = int(yy)
+        xx_i = int(xx)
+        key = canonical_offset(yy_i, xx_i)
+        if key in selected_keys:
+            continue
+        if any((yy_i - sy) ** 2 + (xx_i - sx) ** 2 < min_distance ** 2 for sy, sx in selected):
+            continue
+        selected.append((yy_i, xx_i))
+        selected_keys.add(key)
+
+    if len(selected) < top_k:
+        for yy, xx in candidates:
+            if len(selected) >= top_k:
+                break
+            yy_i = int(yy)
+            xx_i = int(xx)
+            key = canonical_offset(yy_i, xx_i)
+            if key in selected_keys:
+                continue
+            selected.append((yy_i, xx_i))
+            selected_keys.add(key)
+
+    peaks: list[dict[str, float]] = []
+    for yy, xx in selected[:top_k]:
+        stats = peak_region_stats(yy, xx)
+        peak_val = float(stats["peak_val"])
+        log_power_sum = float(stats["log_power_sum"])
+        broadness = float(stats["broadness"])
+        dx = float(xx - cx)
+        dy = float(cy - yy)
+        angle_deg = float(np.degrees(np.arctan2(dy, dx))) if dx != 0 or dy != 0 else 0.0
+        distance = float(np.hypot(dx, dy))
+
+        mirror_y = int(2 * cy - yy)
+        mirror_x = int(2 * cx - xx)
+        if 0 <= mirror_y < h and 0 <= mirror_x < w and not (mirror_y == yy and mirror_x == xx):
+            mirror_stats = peak_region_stats(mirror_y, mirror_x)
+            log_power_sum += float(mirror_stats["log_power_sum"])
+            broadness = 0.5 * (broadness + float(mirror_stats["broadness"]))
+
+        peaks.append(
+            {
+                "x": dx,
+                "y": dy,
+                "distance": distance,
+                "angle_deg": angle_deg,
+                "log_power_sum": log_power_sum,
+                "broadness": broadness,
+                "peak_val": peak_val,
+                "support_threshold": float(stats["support_threshold"]),
+                "support_count": float(stats["support_count"]),
+                "support_rmax": float(stats["support_rmax"]),
+                "support_rms_unweighted": float(stats["support_rms_unweighted"]),
+                "support_dx_min": float(stats["support_dx_min"]),
+                "support_dx_max": float(stats["support_dx_max"]),
+                "support_dy_min": float(stats["support_dy_min"]),
+                "support_dy_max": float(stats["support_dy_max"]),
+                "plateau_count": float(stats["plateau_count"]),
+                "plateau_rmax": float(stats["plateau_rmax"]),
+                "plateau_dx_min": float(stats["plateau_dx_min"]),
+                "plateau_dx_max": float(stats["plateau_dx_max"]),
+                "plateau_dy_min": float(stats["plateau_dy_min"]),
+                "plateau_dy_max": float(stats["plateau_dy_max"]),
+            }
+        )
+
+    return peaks
+
+
 def compute_fft_products(
     channel: np.ndarray,
     mask: np.ndarray,
@@ -354,17 +525,22 @@ def compute_fft_products(
     fft_highpass_percent: float = 0.0,
     fft_lowpass_percent: float = 0.0,
     fft_threshold_percent: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    debug_peak_stats: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float, list[dict[str, float]]]:
     """
     Build all FFT-related displays.
 
     Returns:
         pre_fft_display: masked image cropped to non-zero mask support
-        fft_logmag_display: shifted log magnitude of FFT
+        fft_logmag_display: shifted log magnitude of FFT after display normalization
+        fft_logmag_raw: shifted log magnitude of FFT before display normalization
+        radial_r: radial distance bins from FFT center (pixels)
+        radial_log_power: log-compressed total power in each radial bin
         ifft_display: inverse FFT (real part), cropped back to FFT input size
         low_pass_removed_percent: percent of original power removed by the low-pass mask
         high_pass_removed_percent: percent of original power removed by the high-pass mask
         remaining_percent: percent of original power remaining after all active filters
+        peaks: strongest local peaks in the current FFT log-magnitude image
     """
     x = channel.astype(np.float32)
     m = mask.astype(np.float32)
@@ -424,7 +600,37 @@ def compute_fft_products(
     high_pass_removed_percent = 100.0 * (base_power - hp_only_power) / max(base_power, eps)
     remaining_percent = 100.0 * final_power / max(base_power, eps)
 
-    mag = np.log1p(np.abs(f))
+    mag_raw = np.log1p(np.abs(f))
+    peaks = find_top_fft_peaks(mag_raw)
+    if debug_peak_stats and peaks:
+        lines = ["\n[FFT peak debug] top-peak support metrics from raw log-magnitude"]
+        for idx, peak in enumerate(peaks, start=1):
+            lines.append(
+                (
+                    f"  peak#{idx} offset=({peak['x']:.0f},{peak['y']:.0f}) "
+                    f"peak={peak['peak_val']:.6f} thr={peak['support_threshold']:.6f} "
+                    f"broad={peak['broadness']:.4f}"
+                )
+            )
+            lines.append(
+                (
+                    f"    support: count={peak['support_count']:.0f} "
+                    f"rmax={peak['support_rmax']:.4f} "
+                    f"rms_unw={peak['support_rms_unweighted']:.4f} "
+                    f"dx=[{peak['support_dx_min']:.2f},{peak['support_dx_max']:.2f}] "
+                    f"dy=[{peak['support_dy_min']:.2f},{peak['support_dy_max']:.2f}]"
+                )
+            )
+            lines.append(
+                (
+                    f"    plateau(==peak): count={peak['plateau_count']:.0f} "
+                    f"rmax={peak['plateau_rmax']:.4f} "
+                    f"dx=[{peak['plateau_dx_min']:.2f},{peak['plateau_dx_max']:.2f}] "
+                    f"dy=[{peak['plateau_dy_min']:.2f},{peak['plateau_dy_max']:.2f}]"
+                )
+            )
+        print("\n".join(lines), flush=True)
+    mag = mag_raw
 
     # Sparse-aware contrast for display: after strong filtering many bins are exactly 0,
     # so compute robust limits from non-zero bins when available.
@@ -452,8 +658,30 @@ def compute_fft_products(
 
     pre_fft_display = robust_normalize(xm_crop)
     fft_logmag_display = np.clip(mag, 0, 1).astype(np.float32)
+    fft_logmag_raw = mag_raw.astype(np.float32)
+
+    # Direction-independent spectrum summary: total FFT power by radius.
+    yy_i, xx_i = np.indices(f.shape)
+    rr = np.sqrt((yy_i - fcy) ** 2 + (xx_i - fcx) ** 2)
+    rbin = np.floor(rr).astype(np.int32)
+    power2d = np.abs(f) ** 2
+    radial_power = np.bincount(rbin.ravel(), weights=power2d.ravel())
+    radial_r = np.arange(radial_power.size, dtype=np.float32)
+    radial_log_power = np.log1p(radial_power).astype(np.float32)
+
     ifft_display = robust_normalize(inv)
-    return pre_fft_display, fft_logmag_display, ifft_display, low_pass_removed_percent, high_pass_removed_percent, remaining_percent
+    return (
+        pre_fft_display,
+        fft_logmag_display,
+        fft_logmag_raw,
+        radial_r,
+        radial_log_power,
+        ifft_display,
+        low_pass_removed_percent,
+        high_pass_removed_percent,
+        remaining_percent,
+        peaks,
+    )
 
 
 # -----------------------------
@@ -461,7 +689,7 @@ def compute_fft_products(
 # -----------------------------
 
 class FFTExplorer:
-    def __init__(self, rgb: np.ndarray):
+    def __init__(self, rgb: np.ndarray, debug_peak_stats: bool = False):
         self.rgb = rgb
         self.h, self.w, _ = rgb.shape
         self.channels = make_channel_bank(rgb)
@@ -474,6 +702,7 @@ class FFTExplorer:
         self.fft_highpass_percent = 0.0
         self.fft_lowpass_percent = 100.0
         self.fft_threshold_value = 0.0
+        self.debug_peak_stats = debug_peak_stats
 
         self.cx0 = (self.w - 1) / 2
         self.cy0 = (self.h - 1) / 2
@@ -491,7 +720,9 @@ class FFTExplorer:
         self.ax_img = self.fig.add_axes([0.03, 0.28, 0.30, 0.67])
         self.ax_pre = self.fig.add_axes([0.35, 0.62, 0.28, 0.33])
         self.ax_fft = self.fig.add_axes([0.65, 0.62, 0.32, 0.33])
-        self.ax_ifft = self.fig.add_axes([0.35, 0.35, 0.62, 0.23])
+        self.ax_ifft = self.fig.add_axes([0.35, 0.39, 0.20, 0.19])
+        self.ax_peaks = self.fig.add_axes([0.58, 0.39, 0.16, 0.19])
+        self.ax_radial = self.fig.add_axes([0.85, 0.39, 0.12, 0.19])
 
         # Controls
         self.ax_channel = self.fig.add_axes([0.02, 0.02, 0.16, 0.19])
@@ -500,8 +731,8 @@ class FFTExplorer:
         self.ax_checks = self.fig.add_axes([0.48, 0.06, 0.12, 0.12])
         self.ax_reset = self.fig.add_axes([0.48, 0.02, 0.12, 0.035])
 
-        slider_left = 0.64
-        slider_width = 0.31
+        slider_left = 0.67
+        slider_width = 0.28
         self.ax_cx = self.fig.add_axes([slider_left, 0.17, slider_width, 0.025])
         self.ax_cy = self.fig.add_axes([slider_left, 0.135, slider_width, 0.025])
         self.ax_width = self.fig.add_axes([slider_left, 0.10, slider_width, 0.025])
@@ -528,6 +759,7 @@ class FFTExplorer:
         self.ax_fft.set_title("2D FFT log magnitude")
         self.ax_fft.set_axis_off()
         self._fft_img_data = dummy_fft
+        self._fft_raw_logmag_data = dummy_fft
         self.txt_fft_metric = self.ax_fft.text(
             0.02,
             0.98,
@@ -539,12 +771,45 @@ class FFTExplorer:
             fontsize=9,
             bbox=dict(facecolor="black", alpha=0.55, boxstyle="round,pad=0.25"),
         )
+        self.txt_fft_hover = self.ax_fft.text(
+            0.02,
+            0.02,
+            "",
+            transform=self.ax_fft.transAxes,
+            ha="left",
+            va="bottom",
+            color="white",
+            fontsize=8,
+            bbox=dict(facecolor="black", alpha=0.45, boxstyle="round,pad=0.2"),
+        )
 
         dummy_ifft = np.zeros((self.h, self.w))
         self.im_ifft = self.ax_ifft.imshow(dummy_ifft, cmap="gray", vmin=0, vmax=1)
         self.ax_ifft.set_title("Inverse FFT (real part)")
         self.ax_ifft.set_axis_off()
         self._ifft_img_data = dummy_ifft
+        self.ax_peaks.set_title("Top FFT peaks")
+        self.ax_peaks.set_axis_off()
+        self.txt_peaks = self.ax_peaks.text(
+            0.0,
+            1.0,
+            "",
+            transform=self.ax_peaks.transAxes,
+            ha="left",
+            va="top",
+            fontsize=7,
+            family="monospace",
+        )
+
+        self.radial_line, = self.ax_radial.plot([0.0], [0.0], color="tab:orange", linewidth=1.5)
+        self.ax_radial.set_title("Radial FFT power")
+        self.ax_radial.set_xlabel("radius (px)")
+        self.ax_radial.set_ylabel("log1p(sum |F|^2)")
+        self.ax_radial.yaxis.set_label_position("left")
+        self.ax_radial.yaxis.tick_left()
+        self.ax_radial.tick_params(axis="both", labelsize=8)
+        self.ax_radial.yaxis.labelpad = 4
+        self.ax_radial.grid(True, alpha=0.2)
         self._popup_views: list[dict] = []
 
         self.radio_channel = RadioButtons(self.ax_channel, self.channels.names, active=self.channels.names.index(self.channel_name))
@@ -637,6 +902,13 @@ class FFTExplorer:
     def on_mouse_move(self, event):
         if self._dragging and event.inaxes == self.ax_img and event.xdata is not None and event.ydata is not None:
             self.set_center(event.xdata, event.ydata)
+        if event.inaxes == self.ax_fft and event.xdata is not None and event.ydata is not None:
+            # Main FFT view uses image pixel axes [0..w, 0..h], so convert to centered freq coords.
+            fx = event.xdata - self._fft_raw_logmag_data.shape[1] / 2.0 + 0.5
+            fy = self._fft_raw_logmag_data.shape[0] / 2.0 - 0.5 - event.ydata
+            self._update_fft_hover_label(fx, fy)
+        elif not self._dragging and event.inaxes != self.ax_fft:
+            self.txt_fft_hover.set_text("")
 
     def set_center(self, x: float, y: float):
         self.sl_cx.set_val(np.clip(x, 0, self.w - 1))
@@ -692,6 +964,19 @@ class FFTExplorer:
         if source_key == "fft":
             ax.set_xlabel("fx")
             ax.set_ylabel("fy")
+            txt_hover = ax.text(
+                0.02,
+                0.02,
+                "",
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                color="white",
+                fontsize=8,
+                bbox=dict(facecolor="black", alpha=0.45, boxstyle="round,pad=0.2"),
+            )
+        else:
+            txt_hover = None
 
         record = {
             "fig": fig,
@@ -699,8 +984,22 @@ class FFTExplorer:
             "im": im,
             "source_key": source_key,
             "title": title,
+            "txt_hover": txt_hover,
         }
         self._popup_views.append(record)
+
+        if source_key == "fft":
+            def on_motion(event):
+                if txt_hover is None:
+                    return
+                if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                    txt_hover.set_text("")
+                    fig.canvas.draw_idle()
+                    return
+                txt_hover.set_text(self._format_fft_hover_text(event.xdata, event.ydata, self._fft_raw_logmag_data))
+                fig.canvas.draw_idle()
+
+            fig.canvas.mpl_connect("motion_notify_event", on_motion)
 
         def on_close(_event):
             self._popup_views = [p for p in self._popup_views if p.get("fig") is not fig]
@@ -726,6 +1025,31 @@ class FFTExplorer:
             # Frequency-centered axes: (0,0) at image center.
             return [-w / 2.0, w / 2.0, h / 2.0, -h / 2.0]
         return [0, w, h, 0]
+
+    @staticmethod
+    def _fft_freq_to_index(x: float, y: float, shape: tuple[int, int]) -> tuple[int, int] | None:
+        h, w = shape
+        ix = int(np.round(x + (w / 2.0 - 0.5)))
+        iy = int(np.round((h / 2.0 - 0.5) - y))
+        if ix < 0 or ix >= w or iy < 0 or iy >= h:
+            return None
+        return iy, ix
+
+    def _format_fft_hover_text(self, x: float, y: float, raw_fft: np.ndarray) -> str:
+        idx = self._fft_freq_to_index(x, y, raw_fft.shape)
+        if idx is None:
+            return ""
+        iy, ix = idx
+        fx = ix - raw_fft.shape[1] / 2.0 + 0.5
+        fy = raw_fft.shape[0] / 2.0 - 0.5 - iy
+        raw_val = float(raw_fft[iy, ix])
+        return f"fx={fx:.2f}, fy={fy:.2f}, raw log|F|={raw_val:.6f}"
+
+    def _update_fft_hover_label(self, x: float, y: float) -> None:
+        if self._fft_raw_logmag_data.size == 0:
+            return
+        self.txt_fft_hover.set_text(self._format_fft_hover_text(x, y, self._fft_raw_logmag_data))
+        self.fig.canvas.draw_idle()
 
     def _refresh_open_popups(self) -> None:
         active: list[dict] = []
@@ -769,13 +1093,25 @@ class FFTExplorer:
         self.mask_overlay.set_data(mask)
         self.mask_overlay.set_alpha(0.35)
 
-        pre_img, fft_img, ifft_img, low_pass_removed_percent, high_pass_removed_percent, remaining_percent = compute_fft_products(
+        (
+            pre_img,
+            fft_img,
+            fft_raw_logmag,
+            radial_r,
+            radial_log_power,
+            ifft_img,
+            low_pass_removed_percent,
+            high_pass_removed_percent,
+            remaining_percent,
+            peaks,
+        ) = compute_fft_products(
             channel=channel,
             mask=mask,
             zero_pad=self.zero_pad,
             fft_highpass_percent=self.fft_highpass_percent,
             fft_lowpass_percent=self.fft_lowpass_percent,
             fft_threshold_percent=self.fft_threshold_value,
+            debug_peak_stats=self.debug_peak_stats,
         )
 
         self.im_pre.set_data(pre_img)
@@ -789,12 +1125,17 @@ class FFTExplorer:
         self.ax_fft.set_xlim(0, fft_img.shape[1])
         self.ax_fft.set_ylim(fft_img.shape[0], 0)
         self._fft_img_data = fft_img
+        self._fft_raw_logmag_data = fft_raw_logmag
 
         self.im_ifft.set_data(ifft_img)
         self.im_ifft.set_extent([0, ifft_img.shape[1], ifft_img.shape[0], 0])
         self.ax_ifft.set_xlim(0, ifft_img.shape[1])
         self.ax_ifft.set_ylim(ifft_img.shape[0], 0)
         self._ifft_img_data = ifft_img
+
+        self.radial_line.set_data(radial_r, radial_log_power)
+        self.ax_radial.relim()
+        self.ax_radial.autoscale_view()
 
         self.ax_img.set_title(f"Image with mask overlay | channel: {self.channel_name}")
         self.ax_pre.set_title("Masked image crop (zeros outside mask removed)")
@@ -805,6 +1146,17 @@ class FFTExplorer:
             f"remaining power: {remaining_percent:.2f}%"
         )
         self.ax_ifft.set_title("Inverse FFT of spectrum (real part)")
+        peak_lines = [
+            "#      x      y   dist   ang   logsum  broad",
+            "---------------------------------------------",
+        ]
+        for idx, peak in enumerate(peaks, start=1):
+            peak_lines.append(
+                f"{idx:>1} {peak['x']:>6.0f} {peak['y']:>6.0f}"
+                f" {peak['distance']:>6.1f} {peak['angle_deg']:>6.0f}"
+                f" {peak['log_power_sum']:>8.2f} {peak['broadness']:>6.2f}"
+            )
+        self.txt_peaks.set_text("\n".join(peak_lines))
 
         self._refresh_open_popups()
         self.fig.canvas.draw_idle()
@@ -814,12 +1166,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive 2D FFT explorer for color images.")
     parser.add_argument("image", help="Input image path, e.g. JPG, PNG, TIFF; HEIC if pillow-heif is installed.")
     parser.add_argument("--max-side", type=int, default=1200, help="Resize largest dimension for speed. Use 0 for no resize.")
+    parser.add_argument(
+        "--debug-peak-stats",
+        action="store_true",
+        help="Print per-peak support geometry from raw FFT log-magnitude for broadness verification.",
+    )
     args = parser.parse_args()
 
     max_side = None if args.max_side == 0 else args.max_side
     rgb = load_image_rgb(args.image, max_side=max_side)
 
-    explorer = FFTExplorer(rgb)
+    explorer = FFTExplorer(rgb, debug_peak_stats=args.debug_peak_stats)
     plt.show()
 
 
