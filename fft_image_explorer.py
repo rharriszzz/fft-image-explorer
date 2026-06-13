@@ -336,42 +336,124 @@ def edge_falloff_radial(rn: np.ndarray, edge_type: str, softness: float) -> np.n
 # FFT display
 # -----------------------------
 
-def compute_fft_display(channel: np.ndarray, mask: np.ndarray, remove_mean: bool, zero_pad: bool) -> np.ndarray:
-    """
-    Apply mask and compute shifted log magnitude FFT display image.
+def crop_to_mask_nonzero(xm: np.ndarray, mask: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Crop to the tight bounding box where mask is non-zero-ish."""
+    idx = np.argwhere(mask > eps)
+    if idx.size == 0:
+        return np.zeros((1, 1), dtype=np.float32)
 
-    remove_mean subtracts the weighted mean inside the mask to suppress the DC spike.
-    zero_pad pads to 2x size, which gives a smoother-looking spectrum but not more true resolution.
+    y0, x0 = idx.min(axis=0)
+    y1, x1 = idx.max(axis=0) + 1
+    return xm[y0:y1, x0:x1].astype(np.float32)
+
+
+def compute_fft_products(
+    channel: np.ndarray,
+    mask: np.ndarray,
+    zero_pad: bool,
+    fft_highpass_percent: float = 0.0,
+    fft_lowpass_percent: float = 0.0,
+    fft_threshold_percent: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    """
+    Build all FFT-related displays.
+
+    Returns:
+        pre_fft_display: masked image cropped to non-zero mask support
+        fft_logmag_display: shifted log magnitude of FFT
+        ifft_display: inverse FFT (real part), cropped back to FFT input size
+        low_pass_removed_percent: percent of original power removed by the low-pass mask
+        high_pass_removed_percent: percent of original power removed by the high-pass mask
+        remaining_percent: percent of original power remaining after all active filters
     """
     x = channel.astype(np.float32)
     m = mask.astype(np.float32)
 
-    if remove_mean:
-        denom = float(m.sum())
-        if denom > 1e-9:
-            mean = float((x * m).sum() / denom)
-            x = x - mean
-
     xm = x * m
+    xm_crop = crop_to_mask_nonzero(xm, m)
+
+    # The FFT is computed on the cropped non-zero region so the display focuses on useful content.
+    fft_input = xm_crop
+    in_h, in_w = fft_input.shape
 
     if zero_pad:
-        h, w = xm.shape
-        padded = np.zeros((2 * h, 2 * w), dtype=np.float32)
-        y0 = h // 2
-        x0 = w // 2
-        padded[y0:y0 + h, x0:x0 + w] = xm
-        xm = padded
+        padded = np.zeros((2 * in_h, 2 * in_w), dtype=np.float32)
+        y0 = in_h // 2
+        x0 = in_w // 2
+        padded[y0:y0 + in_h, x0:x0 + in_w] = fft_input
+        fft_input = padded
 
-    f = np.fft.fftshift(np.fft.fft2(xm))
+    f = np.fft.fftshift(np.fft.fft2(fft_input))
+    base_power = float((np.abs(f) ** 2).sum())
+
+    fh, fw = f.shape
+    fcy, fcx = fh // 2, fw // 2
+    yy, xx = np.ogrid[:fh, :fw]
+    max_radius_px = math.hypot(fh / 2.0, fw / 2.0)
+
+    hp_keep_mask = np.ones((fh, fw), dtype=bool)
+    lp_keep_mask = np.ones((fh, fw), dtype=bool)
+
+    # High-pass filter in frequency domain: zero bins near the FFT origin.
+    if fft_highpass_percent > 0.0:
+        hp_radius_px = fft_highpass_percent * 0.01 * max_radius_px
+        low_freq_mask = (yy - fcy) ** 2 + (xx - fcx) ** 2 <= hp_radius_px ** 2
+        hp_keep_mask = ~low_freq_mask
+        f = f * hp_keep_mask
+
+    # Low-pass filter in frequency domain: keep only bins near the FFT origin.
+    if fft_lowpass_percent > 0.0:
+        lp_radius_px = fft_lowpass_percent * 0.01 * max_radius_px
+        lp_keep_mask = (yy - fcy) ** 2 + (xx - fcx) ** 2 <= lp_radius_px ** 2
+        f = f * lp_keep_mask
+
+    # Apply FFT thresholding if enabled (based on log-magnitude)
+    if fft_threshold_percent > 0.0:
+        mag = np.log1p(np.abs(f))
+        mag_max = float(mag.max())
+        threshold_val = mag_max * (fft_threshold_percent / 100.0)
+        f_mask = mag >= threshold_val
+        f = f * f_mask.astype(np.complex64)
+
+    final_power = float((np.abs(f) ** 2).sum())
+    hp_only_power = float((np.abs(np.fft.fftshift(np.fft.fft2(fft_input)) * hp_keep_mask) ** 2).sum()) if fft_highpass_percent > 0.0 else base_power
+    lp_only_power = float((np.abs(np.fft.fftshift(np.fft.fft2(fft_input)) * lp_keep_mask) ** 2).sum()) if fft_lowpass_percent > 0.0 else base_power
+
+    eps = 1e-12
+    low_pass_removed_percent = 100.0 * (base_power - lp_only_power) / max(base_power, eps)
+    high_pass_removed_percent = 100.0 * (base_power - hp_only_power) / max(base_power, eps)
+    remaining_percent = 100.0 * final_power / max(base_power, eps)
+
     mag = np.log1p(np.abs(f))
 
-    # Robust contrast for display.
-    lo, hi = np.percentile(mag, [1, 99.7])
+    # Sparse-aware contrast for display: after strong filtering many bins are exactly 0,
+    # so compute robust limits from non-zero bins when available.
+    nz = mag[mag > 0]
+    if nz.size >= 32:
+        lo, hi = np.percentile(nz, [5, 99.5])
+    else:
+        lo, hi = np.percentile(mag, [1, 99.7])
+
     if hi > lo:
         mag = (mag - lo) / (hi - lo)
+        mag = np.clip(mag, 0, 1)
+        # Gentle gamma lift improves visibility of retained low-amplitude structure.
+        mag = np.sqrt(mag)
     else:
         mag = np.zeros_like(mag)
-    return np.clip(mag, 0, 1)
+
+    inv_full = np.real(np.fft.ifft2(np.fft.ifftshift(f))).astype(np.float32)
+    if zero_pad:
+        y0 = in_h // 2
+        x0 = in_w // 2
+        inv = inv_full[y0:y0 + in_h, x0:x0 + in_w]
+    else:
+        inv = inv_full
+
+    pre_fft_display = robust_normalize(xm_crop)
+    fft_logmag_display = np.clip(mag, 0, 1).astype(np.float32)
+    ifft_display = robust_normalize(inv)
+    return pre_fft_display, fft_logmag_display, ifft_display, low_pass_removed_percent, high_pass_removed_percent, remaining_percent
 
 
 # -----------------------------
@@ -386,23 +468,30 @@ class FFTExplorer:
 
         self.channel_name = "Y luminance"
         self.mask_type = "Ellipse/circle"
-        self.edge_type = "Cosine"
-        self.remove_mean = True
+        self.edge_type = "Gaussian"
         self.zero_pad = False
+        self.link_dimensions = True
+        self.fft_highpass_percent = 0.0
+        self.fft_lowpass_percent = 100.0
+        self.fft_threshold_value = 0.0
 
         self.cx0 = (self.w - 1) / 2
         self.cy0 = (self.h - 1) / 2
-        self.width0 = min(self.w, self.h) * 0.55
-        self.height0 = min(self.w, self.h) * 0.55
+        self.width0 = 100.0
+        self.height0 = 100.0
+        self._linking_sliders = False
         self.angle0 = 0.0
         self.softness0 = 0.20
+        self.center_dot_scale0 = 1.5
 
         self.fig = plt.figure(figsize=(14, 8))
         self.fig.canvas.manager.set_window_title("2D FFT Image Explorer")
 
         # Main axes
-        self.ax_img = self.fig.add_axes([0.05, 0.25, 0.40, 0.70])
-        self.ax_fft = self.fig.add_axes([0.52, 0.25, 0.40, 0.70])
+        self.ax_img = self.fig.add_axes([0.03, 0.28, 0.30, 0.67])
+        self.ax_pre = self.fig.add_axes([0.35, 0.62, 0.28, 0.33])
+        self.ax_fft = self.fig.add_axes([0.65, 0.62, 0.32, 0.33])
+        self.ax_ifft = self.fig.add_axes([0.35, 0.35, 0.62, 0.23])
 
         # Controls
         self.ax_channel = self.fig.add_axes([0.02, 0.02, 0.16, 0.19])
@@ -419,22 +508,50 @@ class FFTExplorer:
         self.ax_height = self.fig.add_axes([slider_left, 0.065, slider_width, 0.025])
         self.ax_angle = self.fig.add_axes([slider_left, 0.03, slider_width, 0.025])
         self.ax_soft = self.fig.add_axes([slider_left, 0.205, slider_width, 0.025])
+        self.ax_fft_thresh = self.fig.add_axes([slider_left, 0.245, slider_width, 0.025])
+        self.ax_fft_highpass = self.fig.add_axes([slider_left, 0.275, slider_width, 0.025])
+        self.ax_fft_lowpass = self.fig.add_axes([slider_left, 0.305, slider_width, 0.025])
 
         self.im_img = self.ax_img.imshow(self.rgb)
         self.mask_overlay = self.ax_img.imshow(np.zeros((self.h, self.w)), alpha=0.35, cmap="magma", vmin=0, vmax=1)
         self.ax_img.set_title("Image with mask overlay")
         self.ax_img.set_axis_off()
 
+        dummy_pre = np.zeros((self.h, self.w))
+        self.im_pre = self.ax_pre.imshow(dummy_pre, cmap="gray", vmin=0, vmax=1)
+        self.ax_pre.set_title("Masked image crop (input to FFT)")
+        self.ax_pre.set_axis_off()
+        self._pre_img_data = dummy_pre
+
         dummy_fft = np.zeros((self.h, self.w))
         self.im_fft = self.ax_fft.imshow(dummy_fft, cmap="gray", vmin=0, vmax=1)
         self.ax_fft.set_title("2D FFT log magnitude")
         self.ax_fft.set_axis_off()
+        self._fft_img_data = dummy_fft
+        self.txt_fft_metric = self.ax_fft.text(
+            0.02,
+            0.98,
+            "",
+            transform=self.ax_fft.transAxes,
+            ha="left",
+            va="top",
+            color="white",
+            fontsize=9,
+            bbox=dict(facecolor="black", alpha=0.55, boxstyle="round,pad=0.25"),
+        )
+
+        dummy_ifft = np.zeros((self.h, self.w))
+        self.im_ifft = self.ax_ifft.imshow(dummy_ifft, cmap="gray", vmin=0, vmax=1)
+        self.ax_ifft.set_title("Inverse FFT (real part)")
+        self.ax_ifft.set_axis_off()
+        self._ifft_img_data = dummy_ifft
+        self._popup_views: list[dict] = []
 
         self.radio_channel = RadioButtons(self.ax_channel, self.channels.names, active=self.channels.names.index(self.channel_name))
         self.radio_mask = RadioButtons(self.ax_mask, ["Full image", "Rectangle", "Rotated rectangle", "Ellipse/circle"], active=3)
-        self.radio_edge = RadioButtons(self.ax_edge, ["Hard", "Cosine", "Gaussian"], active=1)
+        self.radio_edge = RadioButtons(self.ax_edge, ["Hard", "Cosine", "Gaussian"], active=2)
 
-        self.checks = CheckButtons(self.ax_checks, ["remove mean", "zero pad"], [self.remove_mean, self.zero_pad])
+        self.checks = CheckButtons(self.ax_checks, ["zero pad", "link w/h"], [self.zero_pad, self.link_dimensions])
         self.btn_reset = Button(self.ax_reset, "Reset")
 
         self.sl_cx = Slider(self.ax_cx, "center x", 0, self.w - 1, valinit=self.cx0, valstep=1)
@@ -443,6 +560,9 @@ class FFTExplorer:
         self.sl_height = Slider(self.ax_height, "height", 2, self.h, valinit=self.height0)
         self.sl_angle = Slider(self.ax_angle, "angle", -180, 180, valinit=self.angle0)
         self.sl_soft = Slider(self.ax_soft, "softness", 0.02, 1.0, valinit=self.softness0)
+        self.sl_fft_thresh = Slider(self.ax_fft_thresh, "FFT thresh %", 0.0, 100.0, valinit=self.fft_threshold_value)
+        self.sl_fft_highpass = Slider(self.ax_fft_highpass, "FFT high-pass %", 0.0, 100.0, valinit=self.fft_highpass_percent)
+        self.sl_fft_lowpass = Slider(self.ax_fft_lowpass, "FFT low-pass %", 0.0, 100.0, valinit=self.fft_lowpass_percent)
 
         self.radio_channel.on_clicked(self.on_channel)
         self.radio_mask.on_clicked(self.on_mask)
@@ -450,7 +570,12 @@ class FFTExplorer:
         self.checks.on_clicked(self.on_check)
         self.btn_reset.on_clicked(self.on_reset)
 
-        for sl in [self.sl_cx, self.sl_cy, self.sl_width, self.sl_height, self.sl_angle, self.sl_soft]:
+        self.sl_width.on_changed(lambda _val: self._on_width_changed(_val))
+        self.sl_height.on_changed(lambda _val: self._on_height_changed(_val))
+        self.sl_fft_thresh.on_changed(lambda _val: self._on_fft_thresh_changed(_val))
+        self.sl_fft_highpass.on_changed(lambda _val: self._on_fft_highpass_changed(_val))
+        self.sl_fft_lowpass.on_changed(lambda _val: self._on_fft_lowpass_changed(_val))
+        for sl in [self.sl_cx, self.sl_cy, self.sl_angle, self.sl_soft]:
             sl.on_changed(lambda _val: self.update())
 
         self._dragging = False
@@ -473,10 +598,10 @@ class FFTExplorer:
         self.update()
 
     def on_check(self, label: str):
-        if label == "remove mean":
-            self.remove_mean = not self.remove_mean
-        elif label == "zero pad":
+        if label == "zero pad":
             self.zero_pad = not self.zero_pad
+        elif label == "link w/h":
+            self.link_dimensions = not self.link_dimensions
         self.update()
 
     def on_reset(self, _event):
@@ -486,9 +611,22 @@ class FFTExplorer:
         self.sl_height.reset()
         self.sl_angle.reset()
         self.sl_soft.reset()
+        self.sl_fft_thresh.reset()
+        self.sl_fft_highpass.reset()
+        self.sl_fft_lowpass.reset()
         self.update()
 
     def on_mouse_press(self, event):
+        if event.inaxes == self.ax_pre:
+            self.open_popup_image("pre", "Masked image crop", cmap="gray", vmin=0, vmax=1)
+            return
+        if event.inaxes == self.ax_fft:
+            self.open_popup_image("fft", "2D FFT log magnitude", cmap="gray", vmin=0, vmax=1)
+            return
+        if event.inaxes == self.ax_ifft:
+            self.open_popup_image("ifft", "Inverse FFT (real part)", cmap="gray", vmin=0, vmax=1)
+            return
+
         if event.inaxes == self.ax_img and event.xdata is not None and event.ydata is not None:
             self._dragging = True
             self.set_center(event.xdata, event.ydata)
@@ -503,6 +641,111 @@ class FFTExplorer:
     def set_center(self, x: float, y: float):
         self.sl_cx.set_val(np.clip(x, 0, self.w - 1))
         self.sl_cy.set_val(np.clip(y, 0, self.h - 1))
+
+    def _on_width_changed(self, val: float):
+        """Sync height to width if linking is enabled."""
+        if self.link_dimensions and not self._linking_sliders:
+            self._linking_sliders = True
+            self.sl_height.set_val(val)
+            self._linking_sliders = False
+        self.update()
+
+    def _on_height_changed(self, val: float):
+        """Sync width to height if linking is enabled."""
+        if self.link_dimensions and not self._linking_sliders:
+            self._linking_sliders = True
+            self.sl_width.set_val(val)
+            self._linking_sliders = False
+        self.update()
+
+    def _on_fft_thresh_changed(self, val: float):
+        """Update FFT threshold and refresh."""
+        self.fft_threshold_value = float(val)
+        self.update()
+
+    def _on_fft_highpass_changed(self, val: float):
+        """Update FFT high-pass radius and refresh."""
+        self.fft_highpass_percent = float(val)
+        self.update()
+
+    def _on_fft_lowpass_changed(self, val: float):
+        """Update FFT low-pass radius and refresh."""
+        self.fft_lowpass_percent = float(val)
+        self.update()
+
+    def open_popup_image(
+        self,
+        source_key: str,
+        title: str,
+        cmap: str = "gray",
+        vmin: float = 0.0,
+        vmax: float = 1.0,
+    ) -> None:
+        """Open a new figure window with the provided image for zoom/pan inspection."""
+        image = self._get_source_image(source_key)
+        extent = self._get_source_extent(source_key, image)
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111)
+        im = ax.imshow(image, cmap=cmap, vmin=vmin, vmax=vmax, extent=extent)
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="box")
+        if source_key == "fft":
+            ax.set_xlabel("fx")
+            ax.set_ylabel("fy")
+
+        record = {
+            "fig": fig,
+            "ax": ax,
+            "im": im,
+            "source_key": source_key,
+            "title": title,
+        }
+        self._popup_views.append(record)
+
+        def on_close(_event):
+            self._popup_views = [p for p in self._popup_views if p.get("fig") is not fig]
+
+        fig.canvas.mpl_connect("close_event", on_close)
+
+        fig.tight_layout()
+        fig.canvas.manager.set_window_title(f"Detail: {title}")
+        fig.show()
+
+    def _get_source_image(self, source_key: str) -> np.ndarray:
+        if source_key == "pre":
+            return self._pre_img_data
+        if source_key == "fft":
+            return self._fft_img_data
+        if source_key == "ifft":
+            return self._ifft_img_data
+        raise ValueError(f"Unknown popup source key: {source_key}")
+
+    def _get_source_extent(self, source_key: str, image: np.ndarray) -> list[float]:
+        h, w = image.shape[:2]
+        if source_key == "fft":
+            # Frequency-centered axes: (0,0) at image center.
+            return [-w / 2.0, w / 2.0, h / 2.0, -h / 2.0]
+        return [0, w, h, 0]
+
+    def _refresh_open_popups(self) -> None:
+        active: list[dict] = []
+        for popup in self._popup_views:
+            fig = popup["fig"]
+            if not plt.fignum_exists(fig.number):
+                continue
+
+            img = self._get_source_image(popup["source_key"])
+            im = popup["im"]
+            ax = popup["ax"]
+            extent = self._get_source_extent(popup["source_key"], img)
+            im.set_data(img)
+            im.set_extent(extent)
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            fig.canvas.draw_idle()
+            active.append(popup)
+
+        self._popup_views = active
 
     def current_mask(self) -> np.ndarray:
         return make_mask(
@@ -526,20 +769,44 @@ class FFTExplorer:
         self.mask_overlay.set_data(mask)
         self.mask_overlay.set_alpha(0.35)
 
-        fft_img = compute_fft_display(
+        pre_img, fft_img, ifft_img, low_pass_removed_percent, high_pass_removed_percent, remaining_percent = compute_fft_products(
             channel=channel,
             mask=mask,
-            remove_mean=self.remove_mean,
             zero_pad=self.zero_pad,
+            fft_highpass_percent=self.fft_highpass_percent,
+            fft_lowpass_percent=self.fft_lowpass_percent,
+            fft_threshold_percent=self.fft_threshold_value,
         )
+
+        self.im_pre.set_data(pre_img)
+        self.im_pre.set_extent([0, pre_img.shape[1], pre_img.shape[0], 0])
+        self.ax_pre.set_xlim(0, pre_img.shape[1])
+        self.ax_pre.set_ylim(pre_img.shape[0], 0)
+        self._pre_img_data = pre_img
+
         self.im_fft.set_data(fft_img)
         self.im_fft.set_extent([0, fft_img.shape[1], fft_img.shape[0], 0])
         self.ax_fft.set_xlim(0, fft_img.shape[1])
         self.ax_fft.set_ylim(fft_img.shape[0], 0)
+        self._fft_img_data = fft_img
+
+        self.im_ifft.set_data(ifft_img)
+        self.im_ifft.set_extent([0, ifft_img.shape[1], ifft_img.shape[0], 0])
+        self.ax_ifft.set_xlim(0, ifft_img.shape[1])
+        self.ax_ifft.set_ylim(ifft_img.shape[0], 0)
+        self._ifft_img_data = ifft_img
 
         self.ax_img.set_title(f"Image with mask overlay | channel: {self.channel_name}")
+        self.ax_pre.set_title("Masked image crop (zeros outside mask removed)")
         self.ax_fft.set_title("2D FFT log magnitude; center = low frequency")
+        self.txt_fft_metric.set_text(
+            f"low-pass removed: {low_pass_removed_percent:.2f}%\n"
+            f"high-pass removed: {high_pass_removed_percent:.2f}%\n"
+            f"remaining power: {remaining_percent:.2f}%"
+        )
+        self.ax_ifft.set_title("Inverse FFT of spectrum (real part)")
 
+        self._refresh_open_popups()
         self.fig.canvas.draw_idle()
 
 

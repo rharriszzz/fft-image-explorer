@@ -2,11 +2,24 @@
 
 Interactive 2D FFT explorer for color images.
 
-This tool lets you:
+This project shows an image in both the spatial and frequency domains so you can see how masks, soft edges, and frequency filters change what remains. It is especially useful for comparing smooth background regions against texture, repeating patterns, and edge-heavy foreground objects.
+
+## What It Helps Explain
+
+This tool can help you answer questions like:
+- whether a region is mostly smooth background or has strong texture/patterns
+- how a bracelet, fabric weave, bead pattern, or printed surface differs from a flat background
+- how much of an image's energy lives near the FFT center versus farther out
+- how mask size, softness, and frequency filtering change the retained content
+- why some regions look similar in the image but separate in frequency space
+
+## Key Capabilities
+
 - load an image
-- choose color-derived channels (Y, RGB, HSV, opponent channels, PCA channels)
-- choose and tune a spatial mask/window
-- inspect the log-magnitude 2D FFT interactively
+- choose color-derived channels such as Y, RGB, HSV, opponent channels, and PCA components
+- choose and tune a spatial mask or window
+- inspect the masked input, the log-magnitude FFT, and the inverse FFT
+- interactively explore high-pass, low-pass, and threshold-based filtering
 
 ## Project Files
 
@@ -65,7 +78,7 @@ pip install pillow-heif
   - GitHub Copilot
   - GitHub Copilot Chat (Codex-capable chat in VS Code)
 
-### 2. Open project in WSL
+### 2. Open the project in WSL
 
 In a WSL terminal:
 
@@ -74,24 +87,24 @@ cd ~/git/fft-image-explorer
 code .
 ```
 
-VS Code should open as a WSL workspace.
+VS Code should reopen as a WSL workspace.
 
 ### 3. Choose Python version and create a virtual environment
 
-Check available Pythons:
+Check available Python versions:
 
 ```bash
 which -a python3
 python3 --version
 ```
 
-Create a venv with your chosen interpreter (example: Python 3.10):
+Create a venv with your chosen interpreter. Example:
 
 ```bash
 python3.10 -m venv .venv
 ```
 
-Activate:
+Activate it:
 
 ```bash
 source .venv/bin/activate
@@ -103,7 +116,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-### 4. Select interpreter in VS Code
+### 4. Select the interpreter in VS Code
 
 - Open Command Palette
 - Run: `Python: Select Interpreter`
@@ -137,7 +150,7 @@ If using Homebrew:
 brew install python@3.12
 ```
 
-### 2. Open project
+### 2. Open the project
 
 ```bash
 cd ~/git/fft-image-explorer
@@ -146,20 +159,20 @@ code .
 
 ### 3. Choose Python and create virtual environment
 
-Check interpreters:
+Check available Python versions:
 
 ```bash
 which -a python3
 python3 --version
 ```
 
-Create venv with selected Python:
+Create a venv with the Python you want. Example:
 
 ```bash
 python3.12 -m venv .venv
 ```
 
-Activate:
+Activate it:
 
 ```bash
 source .venv/bin/activate
@@ -171,7 +184,7 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-### 4. Select interpreter in VS Code
+### 4. Select the interpreter in VS Code
 
 - Open Command Palette
 - Run: `Python: Select Interpreter`
@@ -185,7 +198,7 @@ python fft_image_explorer.py ~/git/beads/beads-photo-1.jpg
 
 ## Using Codex in VS Code
 
-With GitHub Copilot Chat enabled in VS Code, you can ask Codex-style coding prompts directly in chat, for example:
+With GitHub Copilot Chat enabled in VS Code, you can ask Codex-style prompts directly in chat, for example:
 - "Add a save-screenshot button for the FFT pane"
 - "Add keyboard shortcuts for mask controls"
 - "Refactor channel generation into smaller functions"
@@ -195,3 +208,14 @@ With GitHub Copilot Chat enabled in VS Code, you can ask Codex-style coding prom
 - If `ModuleNotFoundError` appears, ensure the venv is activated and dependencies are installed.
 - If VS Code runs a different Python, re-run `Python: Select Interpreter`.
 - If no GUI window appears, verify local GUI support (WSLg/X server on WSL, standard desktop session on macOS).
+
+## Future Extensions
+
+Possible next steps for this project include:
+- saving presets for masks, channels, and filter settings
+- adding export buttons for screenshots of the main view and popups
+- drawing the active filter radius directly on the FFT image
+- adding keyboard shortcuts for common controls
+- supporting batch analysis across many images or regions
+- comparing multiple channels side by side with linked controls
+- adding a simple foreground/background scoring mode
