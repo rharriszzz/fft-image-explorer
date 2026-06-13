@@ -347,6 +347,55 @@ def crop_to_mask_nonzero(xm: np.ndarray, mask: np.ndarray, eps: float = 1e-6) ->
     return xm[y0:y1, x0:x1].astype(np.float32)
 
 
+def pad_with_tiled_edge_blocks(
+    x: np.ndarray,
+    pad_top: int,
+    pad_bottom: int,
+    pad_left: int,
+    pad_right: int,
+    block_size: int = 20,
+) -> np.ndarray:
+    """Pad by repeating edge-adjacent blocks, not single edge pixels."""
+    h, w = x.shape
+    out_h = h + pad_top + pad_bottom
+    out_w = w + pad_left + pad_right
+    out = np.zeros((out_h, out_w), dtype=x.dtype)
+
+    out[pad_top:pad_top + h, pad_left:pad_left + w] = x
+
+    bh = max(1, min(block_size, h))
+    bw = max(1, min(block_size, w))
+
+    def pingpong_index(k: int, n: int) -> int:
+        if n <= 1:
+            return 0
+        period = 2 * n
+        t = k % period
+        return t if t < n else (2 * n - 1 - t)
+
+    # Build inward-oriented edge bands: index 0 is the nearest source sample at the edge.
+    top_band = x[:bh, :]
+    bottom_band = x[h - bh:, :][::-1, :]
+
+    for i in range(pad_top):
+        out[pad_top - 1 - i, pad_left:pad_left + w] = top_band[pingpong_index(i, bh), :]
+
+    for i in range(pad_bottom):
+        out[pad_top + h + i, pad_left:pad_left + w] = bottom_band[pingpong_index(i, bh), :]
+
+    center_cols = out[:, pad_left:pad_left + w]
+    left_band = center_cols[:, :bw]
+    right_band = center_cols[:, w - bw:][:, ::-1]
+
+    for j in range(pad_left):
+        out[:, pad_left - 1 - j] = left_band[:, pingpong_index(j, bw)]
+
+    for j in range(pad_right):
+        out[:, pad_left + w + j] = right_band[:, pingpong_index(j, bw)]
+
+    return out
+
+
 def find_top_fft_peaks(logmag: np.ndarray, top_k: int = 5, min_distance: int = 6) -> list[dict[str, float]]:
     """Find the strongest local maxima in a 2D log-magnitude FFT image, merging conjugate pairs."""
     h, w = logmag.shape
@@ -522,6 +571,8 @@ def compute_fft_products(
     channel: np.ndarray,
     mask: np.ndarray,
     zero_pad: bool,
+    square_fft: bool = True,
+    square_pad_mode: str = "edge_block20",
     fft_highpass_percent: float = 0.0,
     fft_lowpass_percent: float = 0.0,
     fft_threshold_percent: float = 0.0,
@@ -550,6 +601,36 @@ def compute_fft_products(
 
     # The FFT is computed on the cropped non-zero region so the display focuses on useful content.
     fft_input = xm_crop
+    src_h, src_w = fft_input.shape
+    pad_top = 0
+    pad_left = 0
+    if square_fft and src_h != src_w:
+        side = max(src_h, src_w)
+        pad_h = side - src_h
+        pad_w = side - src_w
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        if square_pad_mode not in {"edge", "reflect", "edge_block20"}:
+            raise ValueError(f"Unsupported square pad mode: {square_pad_mode}")
+        if square_pad_mode == "edge_block20":
+            fft_input = pad_with_tiled_edge_blocks(
+                fft_input,
+                pad_top=pad_top,
+                pad_bottom=pad_bottom,
+                pad_left=pad_left,
+                pad_right=pad_right,
+                block_size=20,
+            )
+        else:
+            # Propagate boundary values outward to avoid zero-padding discontinuities.
+            fft_input = np.pad(
+                fft_input,
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode=square_pad_mode,
+            )
+
     in_h, in_w = fft_input.shape
 
     if zero_pad:
@@ -656,7 +737,12 @@ def compute_fft_products(
     else:
         inv = inv_full
 
-    pre_fft_display = robust_normalize(xm_crop)
+    # Remove any square-padding frame so inverse display maps to original FFT ROI.
+    if square_fft and (src_h != in_h or src_w != in_w):
+        inv = inv[pad_top:pad_top + src_h, pad_left:pad_left + src_w]
+
+    # Show the actual array sent to FFT so square/edge padding is visible in UI.
+    pre_fft_display = robust_normalize(fft_input)
     fft_logmag_display = np.clip(mag, 0, 1).astype(np.float32)
     fft_logmag_raw = mag_raw.astype(np.float32)
 
@@ -698,6 +784,8 @@ class FFTExplorer:
         self.mask_type = "Ellipse/circle"
         self.edge_type = "Gaussian"
         self.zero_pad = False
+        self.square_fft = True
+        self.square_pad_mode = "edge_block20"
         self.link_dimensions = True
         self.fft_highpass_percent = 0.0
         self.fft_lowpass_percent = 100.0
@@ -1196,6 +1284,8 @@ class FFTExplorer:
             channel=channel,
             mask=mask,
             zero_pad=self.zero_pad,
+            square_fft=self.square_fft,
+            square_pad_mode=self.square_pad_mode,
             fft_highpass_percent=self.fft_highpass_percent,
             fft_lowpass_percent=self.fft_lowpass_percent,
             fft_threshold_percent=self.fft_threshold_value,
