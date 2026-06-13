@@ -747,6 +747,7 @@ class FFTExplorer:
         self.mask_overlay = self.ax_img.imshow(np.zeros((self.h, self.w)), alpha=0.35, cmap="magma", vmin=0, vmax=1)
         self.ax_img.set_title("Image with mask overlay")
         self.ax_img.set_axis_off()
+        self._img_overlay_data = self.rgb.copy()
 
         dummy_pre = np.zeros((self.h, self.w))
         self.im_pre = self.ax_pre.imshow(dummy_pre, cmap="gray", vmin=0, vmax=1)
@@ -788,6 +789,9 @@ class FFTExplorer:
         self.ax_ifft.set_title("Inverse FFT (real part)")
         self.ax_ifft.set_axis_off()
         self._ifft_img_data = dummy_ifft
+        self._peaks_text_data = ""
+        self._radial_r_data = np.zeros(1, dtype=np.float32)
+        self._radial_log_power_data = np.zeros(1, dtype=np.float32)
         self.ax_peaks.set_title("Top FFT peaks")
         self.ax_peaks.set_axis_off()
         self.txt_peaks = self.ax_peaks.text(
@@ -891,8 +895,17 @@ class FFTExplorer:
         if event.inaxes == self.ax_ifft:
             self.open_popup_image("ifft", "Inverse FFT (real part)", cmap="gray", vmin=0, vmax=1)
             return
+        if event.inaxes == self.ax_peaks:
+            self.open_popup_peaks()
+            return
+        if event.inaxes == self.ax_radial:
+            self.open_popup_radial()
+            return
 
         if event.inaxes == self.ax_img and event.xdata is not None and event.ydata is not None:
+            if getattr(event, "dblclick", False):
+                self.open_popup_image("img", "Image with mask overlay", cmap=None)
+                return
             self._dragging = True
             self.set_center(event.xdata, event.ydata)
 
@@ -1010,7 +1023,71 @@ class FFTExplorer:
         fig.canvas.manager.set_window_title(f"Detail: {title}")
         fig.show()
 
+    def open_popup_peaks(self) -> None:
+        """Open a large text-only view of the peak table."""
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111)
+        ax.set_axis_off()
+        txt = ax.text(
+            0.02,
+            0.98,
+            self._peaks_text_data,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            family="monospace",
+        )
+
+        record = {
+            "fig": fig,
+            "ax": ax,
+            "source_key": "peaks",
+            "txt": txt,
+            "title": "Top FFT peaks",
+        }
+        self._popup_views.append(record)
+
+        def on_close(_event):
+            self._popup_views = [p for p in self._popup_views if p.get("fig") is not fig]
+
+        fig.canvas.mpl_connect("close_event", on_close)
+        fig.canvas.manager.set_window_title("Detail: Top FFT peaks")
+        fig.tight_layout()
+        fig.show()
+
+    def open_popup_radial(self) -> None:
+        """Open a large radial FFT power graph."""
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111)
+        line, = ax.plot(self._radial_r_data, self._radial_log_power_data, color="tab:orange", linewidth=1.8)
+        ax.set_title("Radial FFT power")
+        ax.set_xlabel("radius (px)")
+        ax.set_ylabel("log1p(sum |F|^2)")
+        ax.grid(True, alpha=0.25)
+        ax.relim()
+        ax.autoscale_view()
+
+        record = {
+            "fig": fig,
+            "ax": ax,
+            "line": line,
+            "source_key": "radial",
+            "title": "Radial FFT power",
+        }
+        self._popup_views.append(record)
+
+        def on_close(_event):
+            self._popup_views = [p for p in self._popup_views if p.get("fig") is not fig]
+
+        fig.canvas.mpl_connect("close_event", on_close)
+        fig.canvas.manager.set_window_title("Detail: Radial FFT power")
+        fig.tight_layout()
+        fig.show()
+
     def _get_source_image(self, source_key: str) -> np.ndarray:
+        if source_key == "img":
+            return self._img_overlay_data
         if source_key == "pre":
             return self._pre_img_data
         if source_key == "fft":
@@ -1058,14 +1135,22 @@ class FFTExplorer:
             if not plt.fignum_exists(fig.number):
                 continue
 
-            img = self._get_source_image(popup["source_key"])
-            im = popup["im"]
+            source_key = popup["source_key"]
             ax = popup["ax"]
-            extent = self._get_source_extent(popup["source_key"], img)
-            im.set_data(img)
-            im.set_extent(extent)
-            ax.set_xlim(extent[0], extent[1])
-            ax.set_ylim(extent[2], extent[3])
+            if source_key in {"img", "pre", "fft", "ifft"}:
+                img = self._get_source_image(source_key)
+                im = popup["im"]
+                extent = self._get_source_extent(source_key, img)
+                im.set_data(img)
+                im.set_extent(extent)
+                ax.set_xlim(extent[0], extent[1])
+                ax.set_ylim(extent[2], extent[3])
+            elif source_key == "peaks":
+                popup["txt"].set_text(self._peaks_text_data)
+            elif source_key == "radial":
+                popup["line"].set_data(self._radial_r_data, self._radial_log_power_data)
+                ax.relim()
+                ax.autoscale_view()
             fig.canvas.draw_idle()
             active.append(popup)
 
@@ -1092,6 +1177,9 @@ class FFTExplorer:
         # Keep RGB image visible and overlay mask; title says selected channel.
         self.mask_overlay.set_data(mask)
         self.mask_overlay.set_alpha(0.35)
+        # Keep a composed RGB+mask frame for popup zoom inspection.
+        overlay_rgb = plt.get_cmap("magma")(mask)[..., :3]
+        self._img_overlay_data = np.clip((1.0 - 0.35) * self.rgb + 0.35 * overlay_rgb, 0.0, 1.0)
 
         (
             pre_img,
@@ -1136,6 +1224,8 @@ class FFTExplorer:
         self.radial_line.set_data(radial_r, radial_log_power)
         self.ax_radial.relim()
         self.ax_radial.autoscale_view()
+        self._radial_r_data = radial_r
+        self._radial_log_power_data = radial_log_power
 
         self.ax_img.set_title(f"Image with mask overlay | channel: {self.channel_name}")
         self.ax_pre.set_title("Masked image crop (zeros outside mask removed)")
@@ -1156,7 +1246,9 @@ class FFTExplorer:
                 f" {peak['distance']:>6.1f} {peak['angle_deg']:>6.0f}"
                 f" {peak['log_power_sum']:>8.2f} {peak['broadness']:>6.2f}"
             )
-        self.txt_peaks.set_text("\n".join(peak_lines))
+        peaks_text = "\n".join(peak_lines)
+        self.txt_peaks.set_text(peaks_text)
+        self._peaks_text_data = peaks_text
 
         self._refresh_open_popups()
         self.fig.canvas.draw_idle()
