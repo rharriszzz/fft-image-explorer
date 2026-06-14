@@ -1327,13 +1327,14 @@ class FFTExplorer:
         )
         self.ax_ifft.set_title("Inverse FFT of spectrum (real part)")
         peak_lines = [
-            "#      x      y   dist   ang   logsum  broad",
-            "---------------------------------------------",
+            "#      x      y   dist   ang   peak   logsum  broad",
+            "---------------------------------------------------",
         ]
         for idx, peak in enumerate(peaks, start=1):
             peak_lines.append(
                 f"{idx:>1} {peak['x']:>6.0f} {peak['y']:>6.0f}"
                 f" {peak['distance']:>6.1f} {peak['angle_deg']:>6.0f}"
+                f" {peak['peak_val']:>6.2f}"
                 f" {peak['log_power_sum']:>8.2f} {peak['broadness']:>6.2f}"
             )
         peaks_text = "\n".join(peak_lines)
