@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Scan an image with local Gaussian-windowed FFT and map a local FFT metric.
 
-Pass 1: sample exactly 10,000 evenly spaced points (100x100 grid).
-Pass 2: process every pixel in any pass-1 region below threshold and all adjacent
-regions (8-neighborhood on the 100x100 region grid).
-
-Before pass 2 starts, the script prints an estimated CPU time based on pass-1 throughput.
+The scan samples the image on a stride grid (default step=10), prints an
+estimated CPU time before processing, and shows progress markers when the
+estimated runtime is greater than 15 seconds.
 """
 
 from __future__ import annotations
@@ -21,13 +19,13 @@ from PIL import Image, ImageOps
 from fft_image_explorer import find_top_fft_peaks
 
 
-def load_luminance(path: str) -> np.ndarray:
+def load_image_and_luminance(path: str) -> tuple[np.ndarray, np.ndarray]:
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
     rgb = np.asarray(img).astype(np.float32) / 255.0
     y = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
-    return y.astype(np.float32)
+    return rgb, y.astype(np.float32)
 
 
 def make_gaussian_window(size: int = 100, softness: float = 0.2) -> np.ndarray:
@@ -55,16 +53,6 @@ def nearest_coord_indices(length: int, coords: np.ndarray) -> np.ndarray:
     return out.astype(np.int32)
 
 
-def expand_adjacent_regions(mask: np.ndarray) -> np.ndarray:
-    """Expand a coarse region mask to include all 8-connected neighbors."""
-    p = np.pad(mask, 1, mode="constant", constant_values=False)
-    out = mask.copy()
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            out |= p[1 + dy:1 + dy + mask.shape[0], 1 + dx:1 + dx + mask.shape[1]]
-    return out
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Map local FFT metric using 100x100 Gaussian-windowed FFT."
@@ -79,25 +67,14 @@ def main() -> None:
     parser.add_argument(
         "--metric",
         choices=["hp_removed", "first_non_origin_peak"],
-        default="first_non_origin_peak",
-        help="Metric to map (default: first_non_origin_peak)",
+        default="hp_removed",
+        help="Metric to map (default: hp_removed)",
     )
     parser.add_argument(
-        "--exclude-threshold",
-        type=float,
-        default=None,
-        help="Exclude pixels >= this value from second-pass sampling; defaults by metric",
-    )
-    parser.add_argument(
-        "--seed",
+        "--step",
         type=int,
-        default=0,
-        help="RNG seed for second-pass random sampling",
-    )
-    parser.add_argument(
-        "--no-second-pass",
-        action="store_true",
-        help="Only run pass 1 (10k points + nearest-neighbor fill)",
+        default=10,
+        help="Stride in pixels for sampling (default: 10)",
     )
     parser.add_argument(
         "--display-scale",
@@ -115,16 +92,11 @@ def main() -> None:
 
     hp_percent = float(np.clip(args.highpass_percent, 0.0, 100.0))
     metric = args.metric
-    if args.exclude_threshold is None:
-        exclude_threshold = 99.0 if metric == "hp_removed" else 1.5
-    else:
-        exclude_threshold = float(args.exclude_threshold)
-    _ = args.seed  # Reserved for future stochastic variants.
-    no_second_pass = bool(args.no_second_pass)
+    step = max(1, int(args.step))
     display_scale = args.display_scale
     near100_alpha = max(0.05, float(args.near100_alpha))
 
-    y = load_luminance(args.image)
+    rgb, y = load_image_and_luminance(args.image)
     h, w = y.shape
 
     win_size = 100
@@ -144,135 +116,94 @@ def main() -> None:
     low_freq_mask = (yy - fcy) ** 2 + (xx - fcx) ** 2 <= hp_radius_px ** 2
     hp_keep_mask = ~low_freq_mask
 
-    # Exactly 10,000 evenly spaced sample points over image coordinates.
-    grid_n = 100
-    sample_ys = np.linspace(0, h - 1, num=grid_n, dtype=np.float32)
-    sample_xs = np.linspace(0, w - 1, num=grid_n, dtype=np.float32)
-    sample_ys_i = np.rint(sample_ys).astype(np.int32)
-    sample_xs_i = np.rint(sample_xs).astype(np.int32)
-    sampled = np.zeros((grid_n, grid_n), dtype=np.float32)
+    def eval_metric_at(iy: int, ix: int) -> float:
+        patch = y_pad[iy:iy + win_size, ix:ix + win_size]
+        patch_w = patch * window
+        f = np.fft.fftshift(np.fft.fft2(patch_w))
+        base_power = float((np.abs(f) ** 2).sum())
 
-    processed = 0
-    total = grid_n * grid_n
-    cpu_start = time.process_time()
+        if base_power <= 1e-12:
+            return 0.0
+        if metric == "hp_removed":
+            hp_only_power = float((np.abs(f * hp_keep_mask) ** 2).sum())
+            return 100.0 * (base_power - hp_only_power) / base_power
 
-    for iy_idx, iy in enumerate(sample_ys_i):
-        for ix_idx, ix in enumerate(sample_xs_i):
-            patch = y_pad[iy:iy + win_size, ix:ix + win_size]
-            patch_w = patch * window
+        mag_raw = np.log1p(np.abs(f))
+        peaks = find_top_fft_peaks(mag_raw)
+        for p in peaks:
+            if float(p.get("distance", 0.0)) > 0.0:
+                return float(p.get("peak_val", 0.0))
+        return 0.0
 
-            f = np.fft.fftshift(np.fft.fft2(patch_w))
-            base_power = float((np.abs(f) ** 2).sum())
+    ys = np.arange(0, h, step, dtype=np.int32)
+    xs = np.arange(0, w, step, dtype=np.int32)
+    ly_n = int(ys.shape[0])
+    lx_n = int(xs.shape[0])
+    total = ly_n * lx_n
 
-            if base_power <= 1e-12:
-                metric_val = 0.0
-            else:
-                if metric == "hp_removed":
-                    hp_only_power = float((np.abs(f * hp_keep_mask) ** 2).sum())
-                    metric_val = 100.0 * (base_power - hp_only_power) / base_power
-                else:
-                    mag_raw = np.log1p(np.abs(f))
-                    peaks = find_top_fft_peaks(mag_raw)
-                    metric_val = 0.0
-                    for p in peaks:
-                        if float(p.get("distance", 0.0)) > 0.0:
-                            metric_val = float(p.get("peak_val", 0.0))
-                            break
+    calib_n = min(200, total)
+    calib_ids = np.linspace(0, max(total - 1, 0), num=calib_n, dtype=np.int64)
+    t_cal0 = time.process_time()
+    for fid in calib_ids:
+        iy = int(ys[int(fid // lx_n)])
+        ix = int(xs[int(fid % lx_n)])
+        _ = eval_metric_at(iy, ix)
+    t_cal = time.process_time() - t_cal0
+    pps_est = calib_n / max(t_cal, 1e-9)
+    est_cpu_s = total / max(pps_est, 1e-9)
+    print(
+        f"Estimated CPU time: {est_cpu_s:.3f}s "
+        f"for {total} points (step={step}) at ~{pps_est:.1f} points/sec CPU"
+    )
 
-            sampled[iy_idx, ix_idx] = metric_val
-            processed += 1
+    show_progress = est_cpu_s > 15.0
+    next_progress_pct = 5
 
-    pass1_cpu_elapsed = time.process_time() - cpu_start
+    lattice_vals = np.zeros((ly_n, lx_n), dtype=np.float32)
+    t_run0 = time.process_time()
+    done = 0
+    for ly, iy in enumerate(ys):
+        for lx, ix in enumerate(xs):
+            lattice_vals[ly, lx] = eval_metric_at(int(iy), int(ix))
+            done += 1
+            if show_progress:
+                pct = int((100.0 * done) / max(total, 1))
+                while pct >= next_progress_pct and next_progress_pct <= 100:
+                    print(f"Progress: {next_progress_pct}% ({done}/{total})")
+                    next_progress_pct += 5
 
-    # Fill unsampled pixels by nearest sampled neighbor on the 100x100 sample grid.
-    ny = nearest_coord_indices(h, sample_ys)
-    nx = nearest_coord_indices(w, sample_xs)
-    out = sampled[ny[:, None], nx[None, :]].copy()
+    cpu_elapsed = time.process_time() - t_run0
+    pps = done / max(cpu_elapsed, 1e-9)
 
-    second_count = 0
-    second_target = 0
-    if not no_second_pass:
-        # Pass 2: process every pixel in low-threshold regions and all adjacent regions.
-        low_regions = sampled < exclude_threshold
-        region_mask = expand_adjacent_regions(low_regions)
-        pixel_mask = region_mask[ny[:, None], nx[None, :]]
+    ny = nearest_coord_indices(h, ys.astype(np.float32))
+    nx = nearest_coord_indices(w, xs.astype(np.float32))
+    out = lattice_vals[ny[:, None], nx[None, :]].copy()
 
-        second_pixels = np.argwhere(pixel_mask)
-        second_count = int(second_pixels.shape[0])
-        second_target = second_count
-
-        pps_est = processed / max(pass1_cpu_elapsed, 1e-9)
-        est_cpu_s = second_count / max(pps_est, 1e-9)
-        print(
-            f"Estimated pass-2 CPU time: {est_cpu_s:.3f}s "
-            f"for {second_count} pixels at ~{pps_est:.1f} pixels/sec CPU"
-        )
-
-        if second_count > 0:
-            for iy, ix in second_pixels:
-                patch = y_pad[iy:iy + win_size, ix:ix + win_size]
-                patch_w = patch * window
-
-                f = np.fft.fftshift(np.fft.fft2(patch_w))
-                base_power = float((np.abs(f) ** 2).sum())
-
-                if base_power <= 1e-12:
-                    metric_val = 0.0
-                else:
-                    if metric == "hp_removed":
-                        hp_only_power = float((np.abs(f * hp_keep_mask) ** 2).sum())
-                        metric_val = 100.0 * (base_power - hp_only_power) / base_power
-                    else:
-                        mag_raw = np.log1p(np.abs(f))
-                        peaks = find_top_fft_peaks(mag_raw)
-                        metric_val = 0.0
-                        for p in peaks:
-                            if float(p.get("distance", 0.0)) > 0.0:
-                                metric_val = float(p.get("peak_val", 0.0))
-                                break
-
-                out[iy, ix] = metric_val
-
-    total_processed = processed + second_count
-
-    cpu_elapsed = time.process_time() - cpu_start
-    pps = total_processed / max(cpu_elapsed, 1e-9)
-    if no_second_pass:
-        print(
-            f"Completed one-pass scan: CPU time {cpu_elapsed:.3f}s, "
-            f"pass1={processed}/{total}, total={total_processed}, "
-            f"{pps:.1f} points/sec CPU"
-        )
-    else:
-        print(
-            f"Completed two-pass sampled scan: CPU time {cpu_elapsed:.3f}s, "
-            f"pass1={processed}/{total}, pass2={second_count}/{second_target} "
-            f"(region+adjacent), "
-            f"total={total_processed}, {pps:.1f} points/sec CPU"
-        )
+    print(
+        f"Completed stride scan: CPU time {cpu_elapsed:.3f}s, "
+        f"processed={done}/{total}, step={step}, {pps:.1f} points/sec CPU"
+    )
     _show_map(
+        rgb,
         out,
         hp_percent,
         metric=metric,
-        processed=processed,
+        processed=done,
         total=total,
-        second_count=second_count,
-        second_target=second_target,
-        exclude_threshold=exclude_threshold,
+        step=step,
         display_scale=display_scale,
         near100_alpha=near100_alpha,
     )
 
 
 def _show_map(
+    rgb: np.ndarray,
     out: np.ndarray,
     hp_percent: float,
     metric: str,
     processed: int,
     total: int,
-    second_count: int,
-    second_target: int,
-    exclude_threshold: float,
+    step: int,
     display_scale: str,
     near100_alpha: float,
 ) -> None:
@@ -303,26 +234,52 @@ def _show_map(
     else:
         ticks = raw_ticks
 
-    plt.figure(figsize=(8, 6))
-    im = plt.imshow(disp, cmap="magma", vmin=vmin, vmax=vmax)
-    cbar = plt.colorbar(im, label=cbar_label)
+    fig, (ax_src, ax_map) = plt.subplots(
+        1,
+        2,
+        figsize=(12, 6),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+
+    ax_src.imshow(rgb, interpolation="nearest")
+    ax_src.set_title("Original image")
+
+    im = ax_map.imshow(disp, cmap="magma", vmin=vmin, vmax=vmax, interpolation="nearest")
+    ax_map.set_title("FFT-derived map")
+
+    h, w = out.shape
+
+    def _fmt_xy_values(x: float, y: float) -> str:
+        ix = int(round(x))
+        iy = int(round(y))
+        if ix < 0 or iy < 0 or ix >= w or iy >= h:
+            return f"x={x:.1f}, y={y:.1f}"
+
+        raw_val = float(out[iy, ix])
+        disp_val = float(disp[iy, ix])
+        return (
+            f"x={ix}, y={iy}, display={disp_val:.3f}, raw={raw_val:.3f}"
+        )
+
+    # Keep toolbar readout useful when non-linear display scaling is active.
+    ax_map.format_coord = _fmt_xy_values
+    ax_src.format_coord = _fmt_xy_values
+
+    cbar = fig.colorbar(im, ax=ax_map, label=cbar_label, fraction=0.046, pad=0.04)
     cbar.set_ticks(ticks)
     if tick_labels is not None:
         cbar.set_ticklabels(tick_labels)
-    if second_target > 0:
-        title_mode = (
-            f"pass2={second_count}/{second_target} (<{exclude_threshold:.2f} + adjacent)"
-        )
-    else:
-        title_mode = "pass2=disabled"
-    plt.title(
+    fig.suptitle(
         "Local Gaussian FFT high-pass removed map\n"
-        "window=100x100, softness=0.2, pass1=100x100 (NN fill), "
-        f"{title_mode}, hp={hp_percent:.2f}%, metric={metric}, "
-        f"pass1 processed={processed}/{total}"
+        "window=100x100, softness=0.2, stride sampling, "
+        f"step={step}, hp={hp_percent:.2f}%, metric={metric}, "
+        f"processed={processed}/{total}"
     )
-    plt.axis("off")
-    plt.tight_layout()
+
+    ax_src.axis("off")
+    ax_map.axis("off")
     plt.show()
 
 
