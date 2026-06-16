@@ -38,8 +38,9 @@ import numpy as np
 from PIL import Image, ImageOps
 
 try:
-    import pillow_heif
-    pillow_heif.register_heif_opener()
+    # import pillow_heif
+    # pillow_heif.register_heif_opener()
+    pass
 except Exception:
     # HEIC/HEIF support is optional.
     pass
