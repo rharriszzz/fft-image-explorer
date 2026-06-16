@@ -45,7 +45,7 @@ except Exception:
     pass
 
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, RadioButtons, CheckButtons, Button
+from matplotlib.widgets import Slider, RadioButtons, CheckButtons, Button, TextBox
 from matplotlib.patches import Rectangle, Ellipse
 
 
@@ -775,10 +775,19 @@ def compute_fft_products(
 # -----------------------------
 
 class FFTExplorer:
-    def __init__(self, rgb: np.ndarray, debug_peak_stats: bool = False):
-        self.rgb = rgb
-        self.h, self.w, _ = rgb.shape
-        self.channels = make_channel_bank(rgb)
+    def __init__(
+        self,
+        rgb_original: np.ndarray,
+        rgb_display: np.ndarray | None = None,
+        debug_peak_stats: bool = False,
+        figure_size: tuple[float, float] = (14.0, 9.5),
+    ):
+        self.rgb_original = rgb_original
+        self.h, self.w, _ = rgb_original.shape
+        self.channels = make_channel_bank(rgb_original)
+
+        self.rgb_display = rgb_display if rgb_display is not None else rgb_original
+        self.disp_h, self.disp_w, _ = self.rgb_display.shape
 
         self.channel_name = "Y luminance"
         self.mask_type = "Ellipse/circle"
@@ -794,14 +803,17 @@ class FFTExplorer:
 
         self.cx0 = (self.w - 1) / 2
         self.cy0 = (self.h - 1) / 2
-        self.width0 = 100.0
-        self.height0 = 100.0
+        # Defaults are specified directly in original-image pixels.
+        self.width0 = 200.0
+        self.height0 = 200.0
+        self.width0 = float(np.clip(self.width0, 2.0, float(self.w)))
+        self.height0 = float(np.clip(self.height0, 2.0, float(self.h)))
         self._linking_sliders = False
         self.angle0 = 0.0
         self.softness0 = 0.20
         self.center_dot_scale0 = 1.5
 
-        self.fig = plt.figure(figsize=(14, 8))
+        self.fig = plt.figure(figsize=figure_size)
         self.fig.canvas.manager.set_window_title("2D FFT Image Explorer")
 
         # Main axes
@@ -820,7 +832,9 @@ class FFTExplorer:
         self.ax_reset = self.fig.add_axes([0.48, 0.02, 0.12, 0.035])
 
         slider_left = 0.67
-        slider_width = 0.28
+        slider_width = 0.21
+        input_gap = 0.01
+        input_width = 0.06
         self.ax_cx = self.fig.add_axes([slider_left, 0.17, slider_width, 0.025])
         self.ax_cy = self.fig.add_axes([slider_left, 0.135, slider_width, 0.025])
         self.ax_width = self.fig.add_axes([slider_left, 0.10, slider_width, 0.025])
@@ -830,12 +844,23 @@ class FFTExplorer:
         self.ax_fft_thresh = self.fig.add_axes([slider_left, 0.245, slider_width, 0.025])
         self.ax_fft_highpass = self.fig.add_axes([slider_left, 0.275, slider_width, 0.025])
         self.ax_fft_lowpass = self.fig.add_axes([slider_left, 0.305, slider_width, 0.025])
+        input_left = slider_left + slider_width + input_gap
+        self.ax_cx_in = self.fig.add_axes([input_left, 0.17, input_width, 0.025])
+        self.ax_cy_in = self.fig.add_axes([input_left, 0.135, input_width, 0.025])
+        self.ax_width_in = self.fig.add_axes([input_left, 0.10, input_width, 0.025])
+        self.ax_height_in = self.fig.add_axes([input_left, 0.065, input_width, 0.025])
+        self.ax_angle_in = self.fig.add_axes([input_left, 0.03, input_width, 0.025])
+        self.ax_soft_in = self.fig.add_axes([input_left, 0.205, input_width, 0.025])
+        self.ax_fft_thresh_in = self.fig.add_axes([input_left, 0.245, input_width, 0.025])
+        self.ax_fft_highpass_in = self.fig.add_axes([input_left, 0.275, input_width, 0.025])
+        self.ax_fft_lowpass_in = self.fig.add_axes([input_left, 0.305, input_width, 0.025])
 
-        self.im_img = self.ax_img.imshow(self.rgb)
-        self.mask_overlay = self.ax_img.imshow(np.zeros((self.h, self.w)), alpha=0.35, cmap="magma", vmin=0, vmax=1)
+        self.im_img = self.ax_img.imshow(self.rgb_display)
+        self.mask_overlay = self.ax_img.imshow(np.zeros((self.disp_h, self.disp_w)), alpha=0.35, cmap="magma", vmin=0, vmax=1)
         self.ax_img.set_title("Image with mask overlay")
         self.ax_img.set_axis_off()
-        self._img_overlay_data = self.rgb.copy()
+        self.ax_img.format_coord = self._format_img_hover_text
+        self._img_overlay_data = self.rgb_display.copy()
 
         dummy_pre = np.zeros((self.h, self.w))
         self.im_pre = self.ax_pre.imshow(dummy_pre, cmap="gray", vmin=0, vmax=1)
@@ -911,8 +936,8 @@ class FFTExplorer:
         self.checks = CheckButtons(self.ax_checks, ["zero pad", "link w/h"], [self.zero_pad, self.link_dimensions])
         self.btn_reset = Button(self.ax_reset, "Reset")
 
-        self.sl_cx = Slider(self.ax_cx, "center x", 0, self.w - 1, valinit=self.cx0, valstep=1)
-        self.sl_cy = Slider(self.ax_cy, "center y", 0, self.h - 1, valinit=self.cy0, valstep=1)
+        self.sl_cx = Slider(self.ax_cx, "center x", 0, self.w - 1, valinit=self.cx0, valstep=1, valfmt="%0.0f")
+        self.sl_cy = Slider(self.ax_cy, "center y", 0, self.h - 1, valinit=self.cy0, valstep=1, valfmt="%0.0f")
         self.sl_width = Slider(self.ax_width, "width", 2, self.w, valinit=self.width0)
         self.sl_height = Slider(self.ax_height, "height", 2, self.h, valinit=self.height0)
         self.sl_angle = Slider(self.ax_angle, "angle", -180, 180, valinit=self.angle0)
@@ -920,6 +945,30 @@ class FFTExplorer:
         self.sl_fft_thresh = Slider(self.ax_fft_thresh, "FFT thresh %", 0.0, 100.0, valinit=self.fft_threshold_value)
         self.sl_fft_highpass = Slider(self.ax_fft_highpass, "FFT high-pass %", 0.0, 100.0, valinit=self.fft_highpass_percent)
         self.sl_fft_lowpass = Slider(self.ax_fft_lowpass, "FFT low-pass %", 0.0, 100.0, valinit=self.fft_lowpass_percent)
+        self.tb_cx = TextBox(self.ax_cx_in, "", initial=f"{int(round(self.cx0))}")
+        self.tb_cy = TextBox(self.ax_cy_in, "", initial=f"{int(round(self.cy0))}")
+        self.tb_width = TextBox(self.ax_width_in, "", initial=f"{self.width0:.1f}")
+        self.tb_height = TextBox(self.ax_height_in, "", initial=f"{self.height0:.1f}")
+        self.tb_angle = TextBox(self.ax_angle_in, "", initial=f"{self.angle0:.1f}")
+        self.tb_soft = TextBox(self.ax_soft_in, "", initial=f"{self.softness0:.3f}")
+        self.tb_fft_thresh = TextBox(self.ax_fft_thresh_in, "", initial=f"{self.fft_threshold_value:.1f}")
+        self.tb_fft_highpass = TextBox(self.ax_fft_highpass_in, "", initial=f"{self.fft_highpass_percent:.1f}")
+        self.tb_fft_lowpass = TextBox(self.ax_fft_lowpass_in, "", initial=f"{self.fft_lowpass_percent:.1f}")
+        self._syncing_inputs = False
+
+        # Hide right-side slider value text; typed entry is shown in the input boxes.
+        for sl in [
+            self.sl_cx,
+            self.sl_cy,
+            self.sl_width,
+            self.sl_height,
+            self.sl_angle,
+            self.sl_soft,
+            self.sl_fft_thresh,
+            self.sl_fft_highpass,
+            self.sl_fft_lowpass,
+        ]:
+            sl.valtext.set_visible(False)
 
         self.radio_channel.on_clicked(self.on_channel)
         self.radio_mask.on_clicked(self.on_mask)
@@ -932,8 +981,20 @@ class FFTExplorer:
         self.sl_fft_thresh.on_changed(lambda _val: self._on_fft_thresh_changed(_val))
         self.sl_fft_highpass.on_changed(lambda _val: self._on_fft_highpass_changed(_val))
         self.sl_fft_lowpass.on_changed(lambda _val: self._on_fft_lowpass_changed(_val))
-        for sl in [self.sl_cx, self.sl_cy, self.sl_angle, self.sl_soft]:
-            sl.on_changed(lambda _val: self.update())
+        self.sl_cx.on_changed(lambda _val: self._on_center_slider_changed())
+        self.sl_cy.on_changed(lambda _val: self._on_center_slider_changed())
+        self.sl_angle.on_changed(lambda _val: self._on_angle_changed())
+        self.sl_soft.on_changed(lambda _val: self._on_soft_changed())
+
+        self.tb_cx.on_submit(lambda text: self._on_center_text_submitted("x", text))
+        self.tb_cy.on_submit(lambda text: self._on_center_text_submitted("y", text))
+        self.tb_width.on_submit(lambda text: self._on_size_text_submitted("width", text))
+        self.tb_height.on_submit(lambda text: self._on_size_text_submitted("height", text))
+        self.tb_angle.on_submit(lambda text: self._on_float_text_submitted(self.sl_angle, self.tb_angle, text, "{:.1f}"))
+        self.tb_soft.on_submit(lambda text: self._on_float_text_submitted(self.sl_soft, self.tb_soft, text, "{:.3f}"))
+        self.tb_fft_thresh.on_submit(lambda text: self._on_float_text_submitted(self.sl_fft_thresh, self.tb_fft_thresh, text, "{:.1f}"))
+        self.tb_fft_highpass.on_submit(lambda text: self._on_float_text_submitted(self.sl_fft_highpass, self.tb_fft_highpass, text, "{:.1f}"))
+        self.tb_fft_lowpass.on_submit(lambda text: self._on_float_text_submitted(self.sl_fft_lowpass, self.tb_fft_lowpass, text, "{:.1f}"))
 
         self._dragging = False
         self.fig.canvas.mpl_connect("button_press_event", self.on_mouse_press)
@@ -995,14 +1056,16 @@ class FFTExplorer:
                 self.open_popup_image("img", "Image with mask overlay", cmap=None)
                 return
             self._dragging = True
-            self.set_center(event.xdata, event.ydata)
+            cx, cy = self._display_to_original_xy(event.xdata, event.ydata)
+            self.set_center(cx, cy)
 
     def on_mouse_release(self, event):
         self._dragging = False
 
     def on_mouse_move(self, event):
         if self._dragging and event.inaxes == self.ax_img and event.xdata is not None and event.ydata is not None:
-            self.set_center(event.xdata, event.ydata)
+            cx, cy = self._display_to_original_xy(event.xdata, event.ydata)
+            self.set_center(cx, cy)
         if event.inaxes == self.ax_fft and event.xdata is not None and event.ydata is not None:
             # Main FFT view uses image pixel axes [0..w, 0..h], so convert to centered freq coords.
             fx = event.xdata - self._fft_raw_logmag_data.shape[1] / 2.0 + 0.5
@@ -1012,8 +1075,108 @@ class FFTExplorer:
             self.txt_fft_hover.set_text("")
 
     def set_center(self, x: float, y: float):
-        self.sl_cx.set_val(np.clip(x, 0, self.w - 1))
-        self.sl_cy.set_val(np.clip(y, 0, self.h - 1))
+        self.sl_cx.set_val(np.clip(round(x), 0, self.w - 1))
+        self.sl_cy.set_val(np.clip(round(y), 0, self.h - 1))
+
+    def _set_textbox_value(self, textbox: TextBox, text: str) -> None:
+        self._syncing_inputs = True
+        textbox.set_val(text)
+        self._syncing_inputs = False
+
+    def _on_center_slider_changed(self) -> None:
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_cx, f"{int(round(self.sl_cx.val))}")
+            self._set_textbox_value(self.tb_cy, f"{int(round(self.sl_cy.val))}")
+        self.update()
+
+    def _on_center_text_submitted(self, axis: str, text: str) -> None:
+        if self._syncing_inputs:
+            return
+        try:
+            value = float(text.strip())
+        except ValueError:
+            if axis == "x":
+                self._set_textbox_value(self.tb_cx, f"{int(round(self.sl_cx.val))}")
+            else:
+                self._set_textbox_value(self.tb_cy, f"{int(round(self.sl_cy.val))}")
+            return
+
+        if axis == "x":
+            clamped = float(np.clip(round(value), 0, self.w - 1))
+            self.sl_cx.set_val(clamped)
+        else:
+            clamped = float(np.clip(round(value), 0, self.h - 1))
+            self.sl_cy.set_val(clamped)
+
+    def _on_size_text_submitted(self, which: str, text: str) -> None:
+        if self._syncing_inputs:
+            return
+        try:
+            value = float(text.strip())
+        except ValueError:
+            if which == "width":
+                self._set_textbox_value(self.tb_width, f"{self.sl_width.val:.1f}")
+            else:
+                self._set_textbox_value(self.tb_height, f"{self.sl_height.val:.1f}")
+            return
+
+        if which == "width":
+            clamped = float(np.clip(value, 2.0, self.w))
+            self.sl_width.set_val(clamped)
+        else:
+            clamped = float(np.clip(value, 2.0, self.h))
+            self.sl_height.set_val(clamped)
+
+    def _on_float_text_submitted(self, slider: Slider, textbox: TextBox, text: str, fmt: str) -> None:
+        if self._syncing_inputs:
+            return
+        try:
+            value = float(text.strip())
+        except ValueError:
+            self._set_textbox_value(textbox, fmt.format(slider.val))
+            return
+
+        clamped = float(np.clip(value, slider.valmin, slider.valmax))
+        slider.set_val(clamped)
+
+    def _on_angle_changed(self) -> None:
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_angle, f"{self.sl_angle.val:.1f}")
+        self.update()
+
+    def _on_soft_changed(self) -> None:
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_soft, f"{self.sl_soft.val:.3f}")
+        self.update()
+
+    def _format_img_hover_text(self, x: float, y: float) -> str:
+        if x < 0 or y < 0 or x > self.disp_w - 1 or y > self.disp_h - 1:
+            return f"x={x:.1f}, y={y:.1f}"
+
+        ox, oy = self._display_to_original_xy(x, y)
+        ix = int(round(ox))
+        iy = int(round(oy))
+        ix = int(np.clip(ix, 0, self.w - 1))
+        iy = int(np.clip(iy, 0, self.h - 1))
+
+        px = self.rgb_original[iy, ix, :]
+        return (
+            f"x={ix}, y={iy}, "
+            f"R={px[0]:.3f}, G={px[1]:.3f}, B={px[2]:.3f}"
+        )
+
+    def _display_to_original_xy(self, x: float, y: float) -> tuple[float, float]:
+        if self.disp_w <= 1:
+            ox = 0.0
+        else:
+            ox = float(x) * float(self.w - 1) / float(self.disp_w - 1)
+
+        if self.disp_h <= 1:
+            oy = 0.0
+        else:
+            oy = float(y) * float(self.h - 1) / float(self.disp_h - 1)
+
+        return ox, oy
 
     def _on_width_changed(self, val: float):
         """Sync height to width if linking is enabled."""
@@ -1021,6 +1184,9 @@ class FFTExplorer:
             self._linking_sliders = True
             self.sl_height.set_val(val)
             self._linking_sliders = False
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_width, f"{self.sl_width.val:.1f}")
+            self._set_textbox_value(self.tb_height, f"{self.sl_height.val:.1f}")
         self.update()
 
     def _on_height_changed(self, val: float):
@@ -1029,21 +1195,30 @@ class FFTExplorer:
             self._linking_sliders = True
             self.sl_width.set_val(val)
             self._linking_sliders = False
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_width, f"{self.sl_width.val:.1f}")
+            self._set_textbox_value(self.tb_height, f"{self.sl_height.val:.1f}")
         self.update()
 
     def _on_fft_thresh_changed(self, val: float):
         """Update FFT threshold and refresh."""
         self.fft_threshold_value = float(val)
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_fft_thresh, f"{self.sl_fft_thresh.val:.1f}")
         self.update()
 
     def _on_fft_highpass_changed(self, val: float):
         """Update FFT high-pass radius and refresh."""
         self.fft_highpass_percent = float(val)
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_fft_highpass, f"{self.sl_fft_highpass.val:.1f}")
         self.update()
 
     def _on_fft_lowpass_changed(self, val: float):
         """Update FFT low-pass radius and refresh."""
         self.fft_lowpass_percent = float(val)
+        if not self._syncing_inputs:
+            self._set_textbox_value(self.tb_fft_lowpass, f"{self.sl_fft_lowpass.val:.1f}")
         self.update()
 
     def open_popup_image(
@@ -1261,13 +1436,23 @@ class FFTExplorer:
         channel = self.channels.arrays[self.channel_name]
         mask = self.current_mask()
 
+        if (self.disp_h, self.disp_w) != (self.h, self.w):
+            mask_disp = np.asarray(
+                Image.fromarray(np.clip(mask * 255.0, 0, 255).astype(np.uint8)).resize(
+                    (self.disp_w, self.disp_h), Image.Resampling.BILINEAR
+                ),
+                dtype=np.float32,
+            ) / 255.0
+        else:
+            mask_disp = mask
+
         # Show scalar channel as background, not RGB, when useful?
         # Keep RGB image visible and overlay mask; title says selected channel.
-        self.mask_overlay.set_data(mask)
+        self.mask_overlay.set_data(mask_disp)
         self.mask_overlay.set_alpha(0.35)
         # Keep a composed RGB+mask frame for popup zoom inspection.
-        overlay_rgb = plt.get_cmap("magma")(mask)[..., :3]
-        self._img_overlay_data = np.clip((1.0 - 0.35) * self.rgb + 0.35 * overlay_rgb, 0.0, 1.0)
+        overlay_rgb = plt.get_cmap("magma")(mask_disp)[..., :3]
+        self._img_overlay_data = np.clip((1.0 - 0.35) * self.rgb_display + 0.35 * overlay_rgb, 0.0, 1.0)
 
         (
             pre_img,
@@ -1349,6 +1534,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive 2D FFT explorer for color images.")
     parser.add_argument("image", help="Input image path, e.g. JPG, PNG, TIFF; HEIC if pillow-heif is installed.")
     parser.add_argument("--max-side", type=int, default=1200, help="Resize largest dimension for speed. Use 0 for no resize.")
+    parser.add_argument("--fig-width", type=float, default=14.0, help="Main window width in inches.")
+    parser.add_argument("--fig-height", type=float, default=9.5, help="Main window height in inches.")
     parser.add_argument(
         "--debug-peak-stats",
         action="store_true",
@@ -1357,9 +1544,17 @@ def main() -> None:
     args = parser.parse_args()
 
     max_side = None if args.max_side == 0 else args.max_side
-    rgb = load_image_rgb(args.image, max_side=max_side)
+    rgb_original = load_image_rgb(args.image, max_side=None)
+    rgb_display = load_image_rgb(args.image, max_side=max_side)
 
-    explorer = FFTExplorer(rgb, debug_peak_stats=args.debug_peak_stats)
+    fig_width = max(6.0, float(args.fig_width))
+    fig_height = max(5.0, float(args.fig_height))
+    explorer = FFTExplorer(
+        rgb_original,
+        rgb_display=rgb_display,
+        debug_peak_stats=args.debug_peak_stats,
+        figure_size=(fig_width, fig_height),
+    )
     plt.show()
 
 
