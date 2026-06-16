@@ -117,7 +117,7 @@ def _trace_outer_spline_step_cells(
     threshold: float = 99.0,
     ring_steps: int = 4,
     clockwise: bool = True,
-    debug_start_point: int = 75,
+    debug_start_point: int | None = None,
 ) -> np.ndarray | None:
     """Trace an outer bracelet spline by stepping along threshold transitions on the step grid."""
     h, w = raw_map.shape
@@ -202,7 +202,10 @@ def _trace_outer_spline_step_cells(
     stop_reason: str | None = None
 
     while True:
-        trace_output = (len(pts) - 1) >= debug_start_point
+        trace_output = (
+            debug_start_point is not None
+            and (len(pts) - 1) >= debug_start_point
+        )
         curr_px = int(xs[curr_x])
         curr_py = int(ys[curr_y])
 
@@ -699,6 +702,15 @@ def main() -> None:
         default=0.35,
         help="Exponent for near100 scaling; smaller values increase detail near 100 (default: 0.35)",
     )
+    parser.add_argument(
+        "--trace-debug-start",
+        type=int,
+        default=-1,
+        help=(
+            "Emit full per-candidate trace debug from this spline-point index onward; "
+            "default: off."
+        ),
+    )
     args = parser.parse_args()
 
     hp_percent = float(np.clip(args.highpass_percent, 0.0, 100.0))
@@ -707,6 +719,9 @@ def main() -> None:
     window_size = max(8, int(args.window_size))
     display_scale = args.display_scale
     near100_alpha = max(0.05, float(args.near100_alpha))
+    trace_debug_start: int | None = (
+        int(args.trace_debug_start) if int(args.trace_debug_start) >= 0 else None
+    )
     rgb, y = load_image_and_luminance(args.image)
     h, w = y.shape
 
@@ -805,6 +820,7 @@ def main() -> None:
         window_size=win_size,
         display_scale=display_scale,
         near100_alpha=near100_alpha,
+        trace_debug_start=trace_debug_start,
     )
 
 
@@ -819,6 +835,7 @@ def _show_map(
     window_size: int,
     display_scale: str,
     near100_alpha: float,
+    trace_debug_start: int | None,
 ) -> None:
     if metric == "hp_removed":
         disp = np.clip(out, 0.0, 100.0)
@@ -866,7 +883,7 @@ def _show_map(
             threshold=99.0,
             ring_steps=4,
             clockwise=True,
-            debug_start_point=75,
+            debug_start_point=trace_debug_start,
         )
         if traced is not None:
             ax_src.plot(traced[:, 0], traced[:, 1], color="white", linewidth=2.0, alpha=0.95)
