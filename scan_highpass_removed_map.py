@@ -99,6 +99,205 @@ def _spline_intersects(outer: np.ndarray, inner: np.ndarray, eps: float = 1e-6) 
     return False
 
 
+def _ensure_closed_curve(points: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    if points.shape[0] < 2:
+        return points
+    if np.hypot(*(points[0] - points[-1])) <= eps:
+        return points
+    return np.vstack([points, points[0]])
+
+
+def _resample_closed_curve(points: np.ndarray, n_samples: int) -> np.ndarray:
+    pts = _ensure_closed_curve(points.astype(np.float64, copy=False))
+    if pts.shape[0] < 2:
+        return pts.astype(np.float32)
+
+    seg = pts[1:] - pts[:-1]
+    seg_len = np.hypot(seg[:, 0], seg[:, 1])
+    total = float(seg_len.sum())
+    if total <= 1e-9:
+        out = np.repeat(pts[:1], max(2, n_samples), axis=0)
+        return out.astype(np.float32)
+
+    cum = np.concatenate(([0.0], np.cumsum(seg_len)))
+    targets = np.linspace(0.0, total, num=max(2, n_samples), endpoint=False)
+    out = np.zeros((targets.shape[0], 2), dtype=np.float64)
+
+    for i, d in enumerate(targets):
+        k = int(np.searchsorted(cum, d, side="right") - 1)
+        k = int(np.clip(k, 0, seg_len.shape[0] - 1))
+        d0 = cum[k]
+        d1 = cum[k + 1]
+        t = 0.0 if d1 <= d0 else (d - d0) / (d1 - d0)
+        out[i] = pts[k] + t * (pts[k + 1] - pts[k])
+
+    out = np.vstack([out, out[0]])
+    return out.astype(np.float32)
+
+
+def _ray_segment_intersection(
+    p: np.ndarray,
+    d: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+    eps: float = 1e-9,
+) -> tuple[float, float] | None:
+    """Solve p + t*d = a + u*(b-a), with ray t>=0 and segment u in [0,1]."""
+    s = b - a
+    denom = _cross2d(float(d[0]), float(d[1]), float(s[0]), float(s[1]))
+    if abs(denom) <= eps:
+        return None
+
+    ap = a - p
+    t = _cross2d(float(ap[0]), float(ap[1]), float(s[0]), float(s[1])) / denom
+    u = _cross2d(float(ap[0]), float(ap[1]), float(d[0]), float(d[1])) / denom
+    if t < eps:
+        return None
+    if u < -eps or u > 1.0 + eps:
+        return None
+    return float(t), float(u)
+
+
+def _inner_hits_along_normal(
+    outer_pt: np.ndarray,
+    normal: np.ndarray,
+    inner_closed: np.ndarray,
+) -> list[tuple[float, np.ndarray]]:
+    """Collect all positive ray hits of the bidirectional normal against inner spline segments."""
+    hits: list[tuple[float, np.ndarray]] = []
+    for sign in (1.0, -1.0):
+        d = normal * sign
+        for i in range(inner_closed.shape[0] - 1):
+            a = inner_closed[i]
+            b = inner_closed[i + 1]
+            hit = _ray_segment_intersection(outer_pt, d, a, b)
+            if hit is None:
+                continue
+            t, _u = hit
+            pt = outer_pt + t * d
+            hits.append((float(t), pt))
+
+    if not hits:
+        return []
+
+    hits.sort(key=lambda row: row[0])
+    deduped: list[tuple[float, np.ndarray]] = []
+    for t, pt in hits:
+        if not deduped:
+            deduped.append((t, pt))
+            continue
+        t_prev, pt_prev = deduped[-1]
+        if abs(t - t_prev) <= 1e-4 and float(np.hypot(*(pt - pt_prev))) <= 1e-4:
+            continue
+        deduped.append((t, pt))
+    return deduped
+
+
+def _nearest_inner_hit_along_normal(
+    outer_pt: np.ndarray,
+    normal: np.ndarray,
+    inner_closed: np.ndarray,
+) -> np.ndarray | None:
+    """Find nearest intersection between a bidirectional normal ray and inner spline segments."""
+    hits = _inner_hits_along_normal(outer_pt=outer_pt, normal=normal, inner_closed=inner_closed)
+    if not hits:
+        return None
+    return hits[0][1]
+
+
+def _ray_hits_with_curve(
+    origin: np.ndarray,
+    direction: np.ndarray,
+    curve_closed: np.ndarray,
+) -> list[tuple[float, np.ndarray]]:
+    """Collect all forward ray intersections with a closed polyline, sorted by distance."""
+    hits: list[tuple[float, np.ndarray]] = []
+    for i in range(curve_closed.shape[0] - 1):
+        a = curve_closed[i]
+        b = curve_closed[i + 1]
+        hit = _ray_segment_intersection(origin, direction, a, b)
+        if hit is None:
+            continue
+        t, _u = hit
+        if t <= 1e-8:
+            continue
+        pt = origin + t * direction
+        hits.append((float(t), pt))
+
+    if not hits:
+        return []
+
+    hits.sort(key=lambda row: row[0])
+    deduped: list[tuple[float, np.ndarray]] = []
+    for t, pt in hits:
+        if not deduped:
+            deduped.append((t, pt))
+            continue
+        t_prev, pt_prev = deduped[-1]
+        if abs(t - t_prev) <= 1e-4 and float(np.hypot(*(pt - pt_prev))) <= 1e-4:
+            continue
+        deduped.append((t, pt))
+    return deduped
+
+
+def _nearest_point_on_closed_polyline(pt: np.ndarray, curve_closed: np.ndarray) -> tuple[np.ndarray, float]:
+    """Return nearest point on a closed polyline to pt and the distance."""
+    best_d2 = float("inf")
+    best_pt = curve_closed[0].astype(np.float64)
+
+    for i in range(curve_closed.shape[0] - 1):
+        a = curve_closed[i].astype(np.float64)
+        b = curve_closed[i + 1].astype(np.float64)
+        ab = b - a
+        ab2 = float(ab[0] * ab[0] + ab[1] * ab[1])
+        if ab2 <= 1e-12:
+            cand = a
+        else:
+            t = float(np.dot(pt - a, ab) / ab2)
+            t = min(1.0, max(0.0, t))
+            cand = a + t * ab
+
+        d = pt - cand
+        d2 = float(d[0] * d[0] + d[1] * d[1])
+        if d2 < best_d2:
+            best_d2 = d2
+            best_pt = cand
+
+    return best_pt, float(math.sqrt(best_d2))
+
+
+def _build_centerline_spline(outer: np.ndarray, inner: np.ndarray) -> np.ndarray | None:
+    if outer is None or inner is None:
+        return None
+    if outer.shape[0] < 3 or inner.shape[0] < 3:
+        return None
+
+    n_samples = max(180, min(1440, 2 * (max(outer.shape[0], inner.shape[0]) - 1)))
+    outer_rs = _resample_closed_curve(outer, n_samples=n_samples).astype(np.float64)
+    inner_rs = _resample_closed_curve(inner, n_samples=n_samples).astype(np.float64)
+
+    inner_open = inner_rs[:-1]
+
+    center_pts: list[np.ndarray] = []
+    for i_pt in inner_open:
+        nearest_outer, dist = _nearest_point_on_closed_polyline(i_pt, outer_rs)
+        if dist <= 1e-9:
+            center_pts.append(i_pt.copy())
+            continue
+        direction = nearest_outer - i_pt
+        center_pts.append(i_pt + 0.5 * direction)
+
+    print(f"Centerline builder: midpoint samples from inner->outer nearest map={len(center_pts)}")
+
+    if len(center_pts) < max(48, n_samples // 3):
+        return None
+
+    center = np.asarray(center_pts, dtype=np.float32)
+    center = _smooth_closed_curve(center, window=9, passes=2)
+    center = _ensure_closed_curve(center)
+    return center.astype(np.float32)
+
+
 def _plot_trace_failure_debug(
     raw_map: np.ndarray,
     coarse: np.ndarray,
@@ -961,8 +1160,8 @@ def main() -> None:
     parser.add_argument(
         "--highpass-percent",
         type=float,
-        required=True,
-        help="High-pass radius percentage (0..100), same meaning as in fft_image_explorer.py",
+        default=8.0,
+        help="High-pass radius percentage (0..100), same meaning as in fft_image_explorer.py (default: 8)",
     )
     parser.add_argument(
         "--metric",
@@ -985,14 +1184,14 @@ def main() -> None:
     parser.add_argument(
         "--display-scale",
         choices=["linear", "near100"],
-        default="linear",
-        help="Color scaling for output map (default: linear)",
+        default="near100",
+        help="Color scaling for output map (default: near100)",
     )
     parser.add_argument(
         "--near100-alpha",
         type=float,
-        default=0.35,
-        help="Exponent for near100 scaling; smaller values increase detail near 100 (default: 0.35)",
+        default=0.25,
+        help="Exponent for near100 scaling; smaller values increase detail near 100 (default: 0.25)",
     )
     parser.add_argument(
         "--trace-debug-start-outer",
@@ -1238,6 +1437,19 @@ def _show_map(
                 )
                 if traced_inner is not None:
                     ax_src.plot(traced_inner[:, 0], traced_inner[:, 1], color="cyan", linewidth=1.8, alpha=0.95)
+                    centerline = _build_centerline_spline(traced_outer, traced_inner)
+                    if centerline is not None:
+                        print(
+                            "Centerline spline: built midpoint curve from outer/inner splines; "
+                            f"samples={centerline.shape[0]}"
+                        )
+                        ax_src.plot(
+                            centerline[:, 0],
+                            centerline[:, 1],
+                            color="yellow",
+                            linewidth=1.6,
+                            alpha=0.95,
+                        )
                     if traced_outer is not None and _spline_intersects(traced_outer, traced_inner):
                         deferred_error = (
                             "Error: inner spline intersects outer spline. "
