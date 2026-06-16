@@ -377,6 +377,7 @@ def _trace_outer_spline_step_cells(
     debug_start_point: int | None = None,
     start_point: tuple[int, int] | None = None,
     spline_label: str = "outer",
+    return_partial_on_stop: bool = False,
 ) -> np.ndarray | None:
     """Trace an outer bracelet spline by stepping along threshold transitions on the step grid."""
     h, w = raw_map.shape
@@ -443,6 +444,25 @@ def _trace_outer_spline_step_cells(
     max_turn_rad = math.radians(90.0)
     stop_reason: str | None = None
 
+    def _find_near_revisit_index(
+        y: int,
+        x: int,
+        points: list[tuple[int, int]],
+        exclude_recent: int = 12,
+        near_dist: float = 1.6,
+    ) -> int | None:
+        end = max(0, len(points) - exclude_recent)
+        for i in range(end):
+            py, px = points[i]
+            if math.hypot(y - py, x - px) <= near_dist:
+                return i
+        return None
+
+    def _partial_trace_pixels() -> np.ndarray | None:
+        if len(pts) < 2:
+            return None
+        return np.array([[float(xs[ix]), float(ys[iy])] for iy, ix in pts], dtype=np.float32)
+
     while True:
         trace_output = (
             debug_start_point is not None
@@ -478,6 +498,8 @@ def _trace_outer_spline_step_cells(
                 f"raw={raw_here:.3f}, threshold={threshold:.3f}, "
                 f"disk_hi={disk_hi}/{disk_n}, points_traced={len(pts)}"
             )
+            if return_partial_on_stop:
+                return _partial_trace_pixels()
             return None
 
         best: tuple[int, int] | None = None
@@ -563,6 +585,8 @@ def _trace_outer_spline_step_cells(
                 f"Tracer stop ({spline_label} spline): insufficient in-bounds ring samples to validate transitions; "
                 f"{spline_label} spline point grid(y={curr_y},x={curr_x})"
             )
+            if return_partial_on_stop:
+                return _partial_trace_pixels()
             return None
 
         for i, row in enumerate(in_bounds_entries):
@@ -722,6 +746,8 @@ def _trace_outer_spline_step_cells(
                     spline_label=spline_label,
                     is_transition_fn=is_transition,
                 )
+            if return_partial_on_stop:
+                return _partial_trace_pixels()
             return None
 
         if best is None:
@@ -835,7 +861,9 @@ def _trace_outer_spline_step_cells(
                 f"  turn angle at {spline_label} spline point {len(pts) - 1}: unavailable (need >= 3 points)"
             )
 
-        if len(pts) > 30 and math.hypot(curr_y - start_y, curr_x - start_x) <= max(1.5, 0.5 * r):
+        # Allow a looser near-start closure radius so completed laps are detected
+        # even when the path does not pass exactly through point 0.
+        if len(pts) > 30 and math.hypot(curr_y - start_y, curr_x - start_x) <= max(3.0, 0.9 * r):
             stop_reason = "closed_loop"
             break
 
@@ -852,13 +880,33 @@ def _trace_outer_spline_step_cells(
                 f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])}), "
                 f"raw={float(coarse[curr_y, curr_x]):.3f}, threshold={threshold:.3f}"
             )
-            return None
+            stop_reason = "cycle_loop"
+            break
+
+        near_idx = _find_near_revisit_index(curr_y, curr_x, pts)
+        if near_idx is not None and len(pts) > 30:
+            print(
+                f"Tracer stop ({spline_label} spline): detected near-cycle away from start; "
+                f"current grid(y={curr_y},x={curr_x}) at {spline_label} spline point {len(pts) - 1} "
+                f"is within 1.6 steps of {spline_label} spline point {near_idx}."
+            )
+            print(
+                f"Tracer debug(near-cycle, {spline_label} spline): "
+                f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])}), "
+                f"raw={float(coarse[curr_y, curr_x]):.3f}, threshold={threshold:.3f}"
+            )
+            stop_reason = "near_cycle_loop"
+            break
         visited_at[key] = len(pts) - 1
 
     if stop_reason is None:
+        if return_partial_on_stop:
+            return _partial_trace_pixels()
         return None
 
     if len(pts) < 16:
+        if return_partial_on_stop:
+            return _partial_trace_pixels()
         return None
 
     # Convert from step-grid indices to image pixel coordinates.
@@ -1095,6 +1143,8 @@ def _show_map(
     trace_debug_start_outer: int | None,
     trace_debug_start_inner: int | None,
 ) -> None:
+    deferred_error: str | None = None
+
     if metric == "hp_removed":
         disp = np.clip(out, 0.0, 100.0)
         vmin, vmax = 0.0, 100.0
@@ -1184,14 +1234,16 @@ def _show_map(
                     debug_start_point=trace_debug_start_inner,
                     start_point=inner_start,
                     spline_label="inner",
+                    return_partial_on_stop=True,
                 )
                 if traced_inner is not None:
+                    ax_src.plot(traced_inner[:, 0], traced_inner[:, 1], color="cyan", linewidth=1.8, alpha=0.95)
                     if traced_outer is not None and _spline_intersects(traced_outer, traced_inner):
-                        raise RuntimeError(
+                        deferred_error = (
                             "Error: inner spline intersects outer spline. "
                             "Inner/outer spline intersection is not allowed."
                         )
-                    ax_src.plot(traced_inner[:, 0], traced_inner[:, 1], color="cyan", linewidth=1.8, alpha=0.95)
+                        print(deferred_error)
 
     im = ax_map.imshow(disp, cmap="magma", vmin=vmin, vmax=vmax, interpolation="nearest")
     ax_map.set_title("FFT-derived map")
@@ -1228,6 +1280,8 @@ def _show_map(
     ax_src.axis("off")
     ax_map.axis("off")
     plt.show()
+    if deferred_error is not None:
+        raise RuntimeError(deferred_error)
 
 
 if __name__ == "__main__":
