@@ -259,4 +259,58 @@ Use this block at the end of each focused work session.
 
 ### Open Questions
 
+## Current Spline Implementation Notes
+
+This section captures the currently implemented method in `scan_highpass_removed_map.py`.
+
+### How Spline Start Points Are Found
+
+Outer spline start point:
+
+- Build a coarse grid from the FFT metric map using the scanner step size.
+- Use the thresholded coarse map (`HIGH`/`LOW`).
+- Scan from image-center lines toward edges in this order:
+  - center row: right to left,
+  - center row: left to right,
+  - center column: bottom to top,
+  - center column: top to bottom.
+- Choose the first `LOW` cell encountered as outer start.
+
+Inner spline start point:
+
+- Begin from outer spline point 0.
+- Examine ring transitions around that point at an initial ring radius.
+- Expand ring radius until a new transition pair is found relative to the previous ring.
+- Use the midpoint between that new `HIGH->LOW` and `LOW->HIGH` transition pair as inner start.
+
+### How Outer and Inner Splines Are Built
+
+Outer spline:
+
+- Trace on the coarse step grid.
+- At each current point, evaluate ring candidates in clockwise order.
+- Expect one `LOW->HIGH` and one `HIGH->LOW` transition around the ring.
+- Use local transition geometry and turn control to choose the next point.
+- Stop on transition mismatch, cycle closure, or guard conditions.
+- Smooth and close the resulting curve.
+
+Inner spline:
+
+- Use the same tracer logic, seeded from the inner start point.
+- Apply the same ring-transition and stopping logic.
+- Smooth and close the curve.
+- Enforce non-intersection with outer spline; raise an error if inner crosses outer.
+
+### Centerline Strategy (Current Method)
+
+- Resample inner and outer curves to comparable dense closed polylines.
+- For each inner sample point:
+  - find the nearest point on the outer polyline (nearest point on segments, not only vertices),
+  - compute vector from inner to that outer point,
+  - move halfway along that vector.
+- Collect all halfway points as the raw centerline samples.
+- Smooth and close the final centerline spline.
+
+This centerline method was chosen because it remains usable when bracelet outlines are non-convex.
+
 -

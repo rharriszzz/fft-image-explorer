@@ -24,7 +24,26 @@ This tool can help you answer questions like:
 ## Project Files
 
 - `fft_image_explorer.py` - main interactive app
+- `scan_highpass_removed_map.py` - stride FFT scanner with boundary and centerline spline tracing
+- `notes.md` - project notes and algorithm details
 - `requirements.txt` - Python dependencies
+
+## Bracelet Boundary Scanner (Current Workflow)
+
+The scanner script builds bracelet geometry in three stages on a coarse stride grid:
+
+1. Build a metric map from local FFT analysis.
+2. Trace an outer boundary spline.
+3. Find and trace an inner boundary spline.
+4. Build a centerline spline between inner and outer.
+
+Detailed centerline strategy notes are documented in `notes.md` under the spline implementation section.
+
+Typical scanner command:
+
+```bash
+~/git/fft-image-explorer/.venv/bin/python scan_highpass_removed_map.py ~/git/beads/beads-photo-2.jpg --highpass-percent 8 --metric hp_removed --display-scale near100 --near100-alpha 0.25
+```
 
 ## Quick Start
 
