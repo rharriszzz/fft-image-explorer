@@ -8,8 +8,7 @@ Features:
 - Load an image.
 - Choose a scalar channel derived from RGB:
     R, G, B, luminance Y, HSV H/S/V,
-    opponent channels R-G, B-Y, R+G-2B,
-    simple PCA-like decorrelation channels.
+    and CMYK C/M/Y/K.
 - Choose a spatial mask/window:
     full image, rectangle, rotated rectangle, ellipse/circle.
 - Choose soft edge:
@@ -168,15 +167,21 @@ def make_channel_bank(rgb: np.ndarray) -> ChannelBank:
 
     h, s, v = rgb_to_hsv_np(rgb)
 
-    # Simple opponent/decorrelation-style channels.
-    # These are useful for colored bead/fabric/print patterns.
-    rg = robust_normalize(r - g)
-    by = robust_normalize(b - y)
-    red_vs_cyan = robust_normalize(2 * r - g - b)
-    green_vs_magenta = robust_normalize(2 * g - r - b)
-    blue_vs_yellow = robust_normalize(2 * b - r - g)
-
-    pc1, pc2, pc3 = pca_decorrelation_channels(rgb)
+    # CMYK conversion from normalized RGB.
+    # K is black key; C/M/Y are normalized by (1-K) when possible.
+    k = 1.0 - np.maximum(np.maximum(r, g), b)
+    denom = 1.0 - k
+    c = np.zeros_like(k)
+    m = np.zeros_like(k)
+    y_cmyk = np.zeros_like(k)
+    mask = denom > 1e-12
+    c[mask] = (1.0 - r[mask] - k[mask]) / denom[mask]
+    m[mask] = (1.0 - g[mask] - k[mask]) / denom[mask]
+    y_cmyk[mask] = (1.0 - b[mask] - k[mask]) / denom[mask]
+    c = np.clip(c, 0.0, 1.0)
+    m = np.clip(m, 0.0, 1.0)
+    y_cmyk = np.clip(y_cmyk, 0.0, 1.0)
+    k = np.clip(k, 0.0, 1.0)
 
     arrays = {
         "Y luminance": y,
@@ -186,14 +191,10 @@ def make_channel_bank(rgb: np.ndarray) -> ChannelBank:
         "HSV H": h,
         "HSV S": s,
         "HSV V": v,
-        "R-G opponent": rg,
-        "B-Y opponent": by,
-        "2R-G-B": red_vs_cyan,
-        "2G-R-B": green_vs_magenta,
-        "2B-R-G": blue_vs_yellow,
-        "PCA 1": pc1,
-        "PCA 2": pc2,
-        "PCA 3": pc3,
+        "CMYK C": c,
+        "CMYK M": m,
+        "CMYK Y": y_cmyk,
+        "CMYK K": k,
     }
     names = list(arrays.keys())
     return ChannelBank(names=names, arrays=arrays)
@@ -397,7 +398,7 @@ def pad_with_tiled_edge_blocks(
     return out
 
 
-def find_top_fft_peaks(logmag: np.ndarray, top_k: int = 5, min_distance: int = 6) -> list[dict[str, float]]:
+def find_top_fft_peaks(logmag: np.ndarray, top_k: int = 7, min_distance: int = 6) -> list[dict[str, float]]:
     """Find the strongest local maxima in a 2D log-magnitude FFT image, merging conjugate pairs."""
     h, w = logmag.shape
     cy, cx = h // 2, w // 2
@@ -578,7 +579,20 @@ def compute_fft_products(
     fft_lowpass_percent: float = 0.0,
     fft_threshold_percent: float = 0.0,
     debug_peak_stats: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float, list[dict[str, float]]]:
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[str, int | bool],
+    float,
+    float,
+    float,
+    list[dict[str, float]],
+]:
     """
     Build all FFT-related displays.
 
@@ -589,6 +603,8 @@ def compute_fft_products(
         radial_r: radial distance bins from FFT center (pixels)
         radial_log_power: log-compressed total power in each radial bin
         ifft_display: inverse FFT (real part), cropped back to FFT input size
+        fft_complex_shifted: shifted complex FFT after all active filters
+        fft_recon_meta: metadata needed to crop inverse FFT back to analysis ROI
         low_pass_removed_percent: percent of original power removed by the low-pass mask
         high_pass_removed_percent: percent of original power removed by the high-pass mask
         remaining_percent: percent of original power remaining after all active filters
@@ -683,7 +699,7 @@ def compute_fft_products(
     remaining_percent = 100.0 * final_power / max(base_power, eps)
 
     mag_raw = np.log1p(np.abs(f))
-    peaks = find_top_fft_peaks(mag_raw)
+    peaks = find_top_fft_peaks(mag_raw, top_k=7)
     if debug_peak_stats and peaks:
         lines = ["\n[FFT peak debug] top-peak support metrics from raw log-magnitude"]
         for idx, peak in enumerate(peaks, start=1):
@@ -757,6 +773,16 @@ def compute_fft_products(
     radial_log_power = np.log1p(radial_power).astype(np.float32)
 
     ifft_display = robust_normalize(inv)
+    fft_recon_meta: dict[str, int | bool] = {
+        "src_h": int(src_h),
+        "src_w": int(src_w),
+        "in_h": int(in_h),
+        "in_w": int(in_w),
+        "pad_top": int(pad_top),
+        "pad_left": int(pad_left),
+        "zero_pad": bool(zero_pad),
+        "square_fft": bool(square_fft),
+    }
     return (
         pre_fft_display,
         fft_logmag_display,
@@ -764,6 +790,8 @@ def compute_fft_products(
         radial_r,
         radial_log_power,
         ifft_display,
+        f.astype(np.complex64),
+        fft_recon_meta,
         low_pass_removed_percent,
         high_pass_removed_percent,
         remaining_percent,
@@ -875,6 +903,17 @@ class FFTExplorer:
         self.ax_fft.set_axis_off()
         self._fft_img_data = dummy_fft
         self._fft_raw_logmag_data = dummy_fft
+        self._fft_complex_data = np.zeros((self.h, self.w), dtype=np.complex64)
+        self._fft_recon_meta: dict[str, int | bool] = {
+            "src_h": int(self.h),
+            "src_w": int(self.w),
+            "in_h": int(self.h),
+            "in_w": int(self.w),
+            "pad_top": 0,
+            "pad_left": 0,
+            "zero_pad": False,
+            "square_fft": False,
+        }
         self.txt_fft_metric = self.ax_fft.text(
             0.02,
             0.98,
@@ -904,6 +943,7 @@ class FFTExplorer:
         self.ax_ifft.set_axis_off()
         self._ifft_img_data = dummy_ifft
         self._peaks_text_data = ""
+        self._peaks_data: list[dict[str, float]] = []
         self._radial_r_data = np.zeros(1, dtype=np.float32)
         self._radial_log_power_data = np.zeros(1, dtype=np.float32)
         self.ax_peaks.set_title("Top FFT peaks")
@@ -1288,36 +1328,193 @@ class FFTExplorer:
         fig.show()
 
     def open_popup_peaks(self) -> None:
-        """Open a large text-only view of the peak table."""
-        fig = plt.figure(figsize=(8, 6))
-        ax = fig.add_subplot(111)
-        ax.set_axis_off()
-        txt = ax.text(
-            0.02,
-            0.98,
-            self._peaks_text_data,
-            transform=ax.transAxes,
+        """Open interactive peak-synthesis view from non-zero listed FFT peaks."""
+        if self._fft_complex_data.size == 0:
+            return
+
+        # User-requested behavior: build synthetic FFT only from non-zero listed peaks.
+        nonzero_peaks = [p for p in self._peaks_data if float(p.get("distance", 0.0)) > 1e-9]
+
+        fig = plt.figure(figsize=(16, 9))
+        ax_tbl = fig.add_axes([0.03, 0.58, 0.45, 0.36])
+        ax_pre = fig.add_axes([0.02, 0.11, 0.18, 0.33])
+        ax_fft_orig = fig.add_axes([0.215, 0.11, 0.18, 0.33])
+        ax_fft = fig.add_axes([0.41, 0.11, 0.18, 0.33])
+        ax_ifft = fig.add_axes([0.605, 0.11, 0.18, 0.33])
+        ax_mix = fig.add_axes([0.80, 0.11, 0.18, 0.33])
+
+        ax_tbl.set_axis_off()
+        table_text = self._peaks_text_data
+        ax_tbl.text(
+            0.0,
+            1.0,
+            table_text,
+            transform=ax_tbl.transAxes,
             ha="left",
             va="top",
             fontsize=10,
             family="monospace",
         )
+        fig.text(
+            0.03,
+            0.55,
+            "Strength meaning: 1.0 = original complex amplitude of that conjugate peak pair.",
+            ha="left",
+            va="top",
+            fontsize=10,
+        )
 
-        record = {
-            "fig": fig,
-            "ax": ax,
-            "source_key": "peaks",
-            "txt": txt,
-            "title": "Top FFT peaks",
-        }
-        self._popup_views.append(record)
+        h, w = self._fft_complex_data.shape
+        cy = h // 2
+        cx = w // 2
 
-        def on_close(_event):
-            self._popup_views = [p for p in self._popup_views if p.get("fig") is not fig]
+        def _offset_to_index(dx: float, dy: float) -> tuple[int, int] | None:
+            ix = int(np.round(dx + (w / 2.0 - 0.5)))
+            iy = int(np.round((h / 2.0 - 0.5) - dy))
+            if ix < 0 or ix >= w or iy < 0 or iy >= h:
+                return None
+            return iy, ix
 
-        fig.canvas.mpl_connect("close_event", on_close)
-        fig.canvas.manager.set_window_title("Detail: Top FFT peaks")
-        fig.tight_layout()
+        peak_models: list[dict[str, int]] = []
+        for p in nonzero_peaks:
+            idx = _offset_to_index(float(p["x"]), float(p["y"]))
+            if idx is None:
+                continue
+            iy, ix = idx
+            my = int(2 * cy - iy)
+            mx = int(2 * cx - ix)
+            peak_models.append({"iy": iy, "ix": ix, "my": my, "mx": mx})
+
+        strengths = np.ones(len(peak_models), dtype=np.float32)
+
+        def _fft_display_from_complex(arr: np.ndarray) -> np.ndarray:
+            mag = np.log1p(np.abs(arr)).astype(np.float32)
+            mmax = float(mag.max())
+            if mmax <= 1e-12:
+                return np.zeros_like(mag, dtype=np.float32)
+            return np.power(np.clip(mag / mmax, 0.0, 1.0), 0.6).astype(np.float32)
+
+        def _ifft_signed_display(arr_c: np.ndarray) -> np.ndarray:
+            # Preserve sign in the inverse visualization; midpoint gray is 0.
+            inv_full = np.real(np.fft.ifft2(np.fft.ifftshift(arr_c))).astype(np.float32)
+
+            # Apply the same inverse cropping path as the main FFT view so zero/square
+            # padding corners do not dominate popup interpretation.
+            meta = self._fft_recon_meta
+            inv = inv_full
+            if bool(meta.get("zero_pad", False)):
+                in_h = int(meta.get("in_h", inv.shape[0]))
+                in_w = int(meta.get("in_w", inv.shape[1]))
+                y0 = in_h // 2
+                x0 = in_w // 2
+                inv = inv[y0:y0 + in_h, x0:x0 + in_w]
+
+            if bool(meta.get("square_fft", False)):
+                src_h = int(meta.get("src_h", inv.shape[0]))
+                src_w = int(meta.get("src_w", inv.shape[1]))
+                in_h2 = int(meta.get("in_h", inv.shape[0]))
+                in_w2 = int(meta.get("in_w", inv.shape[1]))
+                if src_h != in_h2 or src_w != in_w2:
+                    pad_top = int(meta.get("pad_top", 0))
+                    pad_left = int(meta.get("pad_left", 0))
+                    inv = inv[pad_top:pad_top + src_h, pad_left:pad_left + src_w]
+
+            scale = float(np.percentile(np.abs(inv), 99.5))
+            if scale <= 1e-12:
+                return np.full_like(inv, 0.5, dtype=np.float32)
+            return np.clip(0.5 + 0.5 * (inv / scale), 0.0, 1.0).astype(np.float32)
+
+        def _build_synth_complex() -> np.ndarray:
+            out = np.zeros_like(self._fft_complex_data, dtype=np.complex64)
+            for k, model in enumerate(peak_models):
+                gain = float(strengths[k])
+                iy = int(model["iy"])
+                ix = int(model["ix"])
+                my = int(model["my"])
+                mx = int(model["mx"])
+                out[iy, ix] = self._fft_complex_data[iy, ix] * gain
+                if 0 <= my < h and 0 <= mx < w and not (my == iy and mx == ix):
+                    out[my, mx] = self._fft_complex_data[my, mx] * gain
+            return out
+
+        synth_c = _build_synth_complex()
+        synth_mag = _fft_display_from_complex(synth_c)
+
+        synth_ifft = _ifft_signed_display(synth_c)
+
+        im_pre = ax_pre.imshow(self._pre_img_data, cmap="gray", vmin=0, vmax=1)
+        ax_pre.set_title("FFT input (mask/filter applied)")
+        ax_pre.set_axis_off()
+
+        orig_fft_disp = _fft_display_from_complex(self._fft_complex_data)
+        im_fft_orig = ax_fft_orig.imshow(orig_fft_disp, cmap="gray", vmin=0, vmax=1)
+        ax_fft_orig.set_title("Original FFT (current view)")
+        ax_fft_orig.set_axis_off()
+
+        im_fft = ax_fft.imshow(synth_mag, cmap="gray", vmin=0, vmax=1)
+        ax_fft.set_title("Synthetic FFT")
+        ax_fft.set_axis_off()
+
+        im_ifft = ax_ifft.imshow(synth_ifft, cmap="gray", vmin=0, vmax=1)
+        ax_ifft.set_title("Inverse FFT")
+        ax_ifft.set_axis_off()
+
+        def _build_mix_rgb(pre_img: np.ndarray, ifft_signed_img: np.ndarray) -> np.ndarray:
+            pre_g = np.clip(pre_img.astype(np.float32), 0.0, 1.0)
+            inv_r = np.clip(np.abs(ifft_signed_img.astype(np.float32) - 0.5) * 2.0, 0.0, 1.0)
+            mix = np.zeros((pre_g.shape[0], pre_g.shape[1], 3), dtype=np.float32)
+            mix[..., 0] = inv_r
+            mix[..., 1] = pre_g
+            return mix
+
+        mix_rgb = _build_mix_rgb(self._pre_img_data, synth_ifft)
+        im_mix = ax_mix.imshow(mix_rgb, vmin=0, vmax=1)
+        ax_mix.set_title("Composite (R=inverse, G=input)")
+        ax_mix.set_axis_off()
+
+        slider_axes: list[plt.Axes] = []
+        sliders: list[Slider] = []
+        y0 = 0.93
+        dy = 0.032
+        max_rows = min(12, len(peak_models))
+
+        for i in range(max_rows):
+            ax_s = fig.add_axes([0.52, y0 - i * dy, 0.45, 0.022])
+            p = nonzero_peaks[i]
+            label = f"peak {i+1} gain ({p['x']:.0f},{p['y']:.0f})"
+            s = Slider(ax_s, label, 0.0, 3.0, valinit=1.0, valfmt="%1.2f")
+            slider_axes.append(ax_s)
+            sliders.append(s)
+
+        reset_y = max(0.53, y0 - max_rows * dy - 0.02)
+        ax_reset = fig.add_axes([0.84, reset_y, 0.13, 0.035])
+        btn_reset = Button(ax_reset, "Reset strengths")
+
+        def _refresh_views() -> None:
+            synth = _build_synth_complex()
+            smag = _fft_display_from_complex(synth)
+            iimg = _ifft_signed_display(synth)
+            im_fft.set_data(smag)
+            im_ifft.set_data(iimg)
+            im_pre.set_data(self._pre_img_data)
+            im_fft_orig.set_data(_fft_display_from_complex(self._fft_complex_data))
+            im_mix.set_data(_build_mix_rgb(self._pre_img_data, iimg))
+            fig.canvas.draw_idle()
+
+        def _on_slider(_val: float) -> None:
+            for i, s in enumerate(sliders):
+                strengths[i] = float(s.val)
+            _refresh_views()
+
+        for s in sliders:
+            s.on_changed(_on_slider)
+
+        def _on_reset(_event) -> None:
+            for s in sliders:
+                s.reset()
+
+        btn_reset.on_clicked(_on_reset)
+        fig.canvas.manager.set_window_title("Detail: Top FFT peaks synthesis")
         fig.show()
 
     def open_popup_radial(self) -> None:
@@ -1462,6 +1659,8 @@ class FFTExplorer:
             radial_r,
             radial_log_power,
             ifft_img,
+            fft_complex,
+            fft_recon_meta,
             low_pass_removed_percent,
             high_pass_removed_percent,
             remaining_percent,
@@ -1490,6 +1689,8 @@ class FFTExplorer:
         self.ax_fft.set_ylim(fft_img.shape[0], 0)
         self._fft_img_data = fft_img
         self._fft_raw_logmag_data = fft_raw_logmag
+        self._fft_complex_data = fft_complex
+        self._fft_recon_meta = fft_recon_meta
 
         self.im_ifft.set_data(ifft_img)
         self.im_ifft.set_extent([0, ifft_img.shape[1], ifft_img.shape[0], 0])
@@ -1513,19 +1714,34 @@ class FFTExplorer:
         )
         self.ax_ifft.set_title("Inverse FFT of spectrum (real part)")
         peak_lines = [
-            "#      x      y   dist   ang   peak   logsum  broad",
-            "---------------------------------------------------",
+            "#      x      y   dist   ang   phase   peak   logsum  broad",
+            "----------------------------------------------------------",
         ]
+
+        fft_h, fft_w = self._fft_complex_data.shape
+        def _phase_deg_for_peak(px: float, py: float) -> float:
+            ix = int(np.round(px + (fft_w / 2.0 - 0.5)))
+            iy = int(np.round((fft_h / 2.0 - 0.5) - py))
+            if ix < 0 or ix >= fft_w or iy < 0 or iy >= fft_h:
+                return 0.0
+            z = self._fft_complex_data[iy, ix]
+            if abs(z) <= 1e-12:
+                return 0.0
+            return float(np.degrees(np.angle(z)))
+
         for idx, peak in enumerate(peaks, start=1):
+            phase_deg = _phase_deg_for_peak(float(peak["x"]), float(peak["y"]))
             peak_lines.append(
                 f"{idx:>1} {peak['x']:>6.0f} {peak['y']:>6.0f}"
                 f" {peak['distance']:>6.1f} {peak['angle_deg']:>6.0f}"
+                f" {phase_deg:>7.1f}"
                 f" {peak['peak_val']:>6.2f}"
                 f" {peak['log_power_sum']:>8.2f} {peak['broadness']:>6.2f}"
             )
         peaks_text = "\n".join(peak_lines)
         self.txt_peaks.set_text(peaks_text)
         self._peaks_text_data = peaks_text
+        self._peaks_data = peaks
 
         self._refresh_open_popups()
         self.fig.canvas.draw_idle()
