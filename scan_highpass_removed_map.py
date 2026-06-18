@@ -14,6 +14,8 @@ import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
+from matplotlib.path import Path
 from PIL import Image, ImageOps
 
 from fft_image_explorer import find_top_fft_peaks
@@ -366,7 +368,9 @@ def _plot_trace_failure_debug(
         f"Tracer debug at {spline_label} spline point {spline_point_index}\n"
         f"{spline_label} spline point=(y={py}, x={px}), threshold={threshold:.1f}, ring={ring_steps} steps ({radius_px} px)"
     )
-    plt.show()
+    # Render this diagnostic window without blocking; final blocking show occurs in _show_map.
+    plt.show(block=False)
+    plt.pause(0.001)
 
 
 def _build_step_grid(
@@ -468,9 +472,40 @@ def _collect_ring_transitions(
     n = len(in_bounds)
     if n < 2:
         return trans
+
+    # Remove isolated one-bin state flips on the circular ring sequence:
+    # LOW,HIGH,LOW -> LOW,LOW,LOW and HIGH,LOW,HIGH -> HIGH,HIGH,HIGH.
+    # This suppresses singular spikes before counting transitions.
+    warned_isolated: set[int] = set()
+    cleaned_states = states.copy()
+    for _ in range(max(1, n)):
+        changed = False
+        next_states = cleaned_states.copy()
+        for i in range(n):
+            prev_s = cleaned_states[(i - 1) % n]
+            curr_s = cleaned_states[i]
+            next_s = cleaned_states[(i + 1) % n]
+            if prev_s == next_s and curr_s != prev_s:
+                if i not in warned_isolated:
+                    prev_row = in_bounds[(i - 1) % n]
+                    curr_row = in_bounds[i]
+                    next_row = in_bounds[(i + 1) % n]
+                    print(
+                        "Warning: removed isolated ring state spike "
+                        f"at grid(y={int(curr_row['ny'])},x={int(curr_row['nx'])}) "
+                        f"values(prev,mid,next)=({float(prev_row['raw']):.3f},"
+                        f"{float(curr_row['raw']):.3f},{float(next_row['raw']):.3f})"
+                    )
+                    warned_isolated.add(i)
+                next_states[i] = prev_s
+                changed = True
+        cleaned_states = next_states
+        if not changed:
+            break
+
     for i, row in enumerate(in_bounds):
-        prev_state = states[(i - 1) % n]
-        curr_state = states[i]
+        prev_state = cleaned_states[(i - 1) % n]
+        curr_state = cleaned_states[i]
         if curr_state != prev_state:
             row_out = dict(row)
             row_out["prev_state"] = prev_state
@@ -788,9 +823,38 @@ def _trace_outer_spline_step_cells(
                 return _partial_trace_pixels()
             return None
 
+        # Suppress isolated one-bin flips in the circular ring sequence so
+        # patterns like LOW,HIGH,LOW or HIGH,LOW,HIGH do not create spurious
+        # extra transitions.
+        cleaned_ring_states = ordered_ring_states.copy()
+        warned_isolated: set[int] = set()
+        for _ in range(max(1, ring_n)):
+            changed = False
+            next_states = cleaned_ring_states.copy()
+            for i in range(ring_n):
+                prev_s = cleaned_ring_states[(i - 1) % ring_n]
+                curr_s = cleaned_ring_states[i]
+                next_s = cleaned_ring_states[(i + 1) % ring_n]
+                if prev_s == next_s and curr_s != prev_s:
+                    if i not in warned_isolated:
+                        prev_meta = ordered_ring_meta[(i - 1) % ring_n]
+                        curr_meta = ordered_ring_meta[i]
+                        next_meta = ordered_ring_meta[(i + 1) % ring_n]
+                        print(
+                            "Warning: removed isolated ring state spike "
+                            f"at grid(y={curr_meta[4]},x={curr_meta[5]}) "
+                            f"values(prev,mid,next)=({prev_meta[6]:.3f},{curr_meta[6]:.3f},{next_meta[6]:.3f})"
+                        )
+                        warned_isolated.add(i)
+                    next_states[i] = prev_s
+                    changed = True
+            cleaned_ring_states = next_states
+            if not changed:
+                break
+
         for i, row in enumerate(in_bounds_entries):
-            prev_state = ordered_ring_states[(i - 1) % ring_n]
-            curr_state = ordered_ring_states[i]
+            prev_state = cleaned_ring_states[(i - 1) % ring_n]
+            curr_state = cleaned_ring_states[i]
             trans = bool(curr_state != prev_state)
             row["transition"] = trans
 
@@ -874,8 +938,8 @@ def _trace_outer_spline_step_cells(
         low_to_high = 0
         high_to_low = 0
         for i in range(ring_n):
-            a = ordered_ring_states[i]
-            b = ordered_ring_states[(i + 1) % ring_n]
+            a = cleaned_ring_states[i]
+            b = cleaned_ring_states[(i + 1) % ring_n]
             if (not a) and b:
                 low_to_high += 1
             elif a and (not b):
@@ -1127,6 +1191,453 @@ def load_image_and_luminance(path: str) -> tuple[np.ndarray, np.ndarray]:
     return rgb, y.astype(np.float32)
 
 
+def _mask_inside_closed_spline(shape: tuple[int, int], spline_xy: np.ndarray) -> np.ndarray:
+    """Return boolean mask for pixels whose centers are inside a closed spline polygon."""
+    h, w = shape
+    poly = np.asarray(spline_xy, dtype=np.float64)
+    if poly.ndim != 2 or poly.shape[1] != 2 or poly.shape[0] < 3:
+        return np.zeros((h, w), dtype=bool)
+    if np.hypot(*(poly[0] - poly[-1])) > 1e-6:
+        poly = np.vstack([poly, poly[0]])
+
+    path = Path(poly)
+    yy, xx = np.mgrid[0:h, 0:w]
+    pts = np.column_stack([xx.ravel(), yy.ravel()])
+    inside = path.contains_points(pts, radius=1e-9)
+    return inside.reshape(h, w)
+
+
+def _coerce_spline_xy(spline_xy: np.ndarray | list | tuple) -> np.ndarray | None:
+    """Best-effort conversion to an Nx2 float array for spline geometry."""
+    arr = np.asarray(spline_xy, dtype=np.float64)
+    if arr.size == 0:
+        return None
+
+    if arr.ndim == 1:
+        if arr.size % 2 != 0:
+            return None
+        arr = arr.reshape(-1, 2)
+    elif arr.ndim == 2:
+        if arr.shape[1] == 2:
+            pass
+        elif arr.shape[0] == 2:
+            arr = arr.T
+        else:
+            return None
+    else:
+        return None
+
+    if arr.shape[0] < 3:
+        return None
+    return arr.astype(np.float32, copy=False)
+
+
+def _normalize_closed_spline_xy(
+    spline_xy: np.ndarray | list | tuple,
+    min_open_points: int = 300,
+) -> np.ndarray | None:
+    """Coerce a spline to closed Nx2 and upsample to a consistent point density."""
+    arr = _coerce_spline_xy(spline_xy)
+    if arr is None:
+        return None
+
+    arr = _ensure_closed_curve(arr.astype(np.float32, copy=False))
+    if arr.shape[0] < 4:
+        return None
+
+    open_n = arr.shape[0] - 1
+    target_open = max(int(min_open_points), int(open_n))
+    if target_open != open_n:
+        arr = _resample_closed_curve(arr, n_samples=target_open)
+    return arr.astype(np.float32, copy=False)
+
+
+def _packed_hsv_from_rgb(rgb: np.ndarray) -> np.ndarray:
+    """Convert RGB [0,1] image to packed 24-bit HSV (8 bits per channel)."""
+    hsv = rgb_to_hsv(np.clip(rgb, 0.0, 1.0).astype(np.float32))
+    hsv_u8 = np.clip(np.round(hsv * 255.0), 0, 255).astype(np.uint8)
+    h = hsv_u8[..., 0].astype(np.uint32)
+    s = hsv_u8[..., 1].astype(np.uint32)
+    v = hsv_u8[..., 2].astype(np.uint32)
+    return (h << 16) | (s << 8) | v
+
+
+def _top_exact_hsv_counts(packed_hsv: np.ndarray, mask: np.ndarray, top_k: int = 20) -> tuple[int, list[tuple[int, int, int, int]]]:
+    vals = packed_hsv[mask]
+    if vals.size == 0:
+        return 0, []
+    uniq, cnt = np.unique(vals, return_counts=True)
+    order = np.argsort(cnt)[::-1]
+    top = []
+    for idx in order[:top_k]:
+        p = int(uniq[idx])
+        c = int(cnt[idx])
+        h = (p >> 16) & 0xFF
+        s = (p >> 8) & 0xFF
+        v = p & 0xFF
+        top.append((h, s, v, c))
+    return int(uniq.size), top
+
+
+def _top_hsv_volume_counts(
+    packed_hsv: np.ndarray,
+    mask: np.ndarray,
+    coverage_target: float = 0.995,
+    max_bars: int = 140,
+    h_bins: int = 24,
+    s_bins: int = 3,
+    v_bins: int = 4,
+    extreme_v_fraction: float = 0.05,
+) -> tuple[list[dict[str, float | int]], dict[str, float | int]]:
+    vals = packed_hsv[mask]
+    if vals.size == 0:
+        return [], {
+            "coverage": 0.0,
+            "h_bins": 0,
+            "s_bins": 0,
+            "v_bins": 0,
+            "bars": 0,
+            "occupied_bins": 0,
+            "total_pixels": 0,
+            "mode": "fixed-bins-with-extreme-v",
+        }
+
+    h = ((vals >> 16) & 0xFF).astype(np.int32)
+    s = ((vals >> 8) & 0xFF).astype(np.int32)
+    v = (vals & 0xFF).astype(np.int32)
+
+    target = float(np.clip(coverage_target, 0.0, 1.0))
+    max_bars = max(1, int(max_bars))
+    total = int(vals.size)
+    target_pixels = int(math.ceil(target * float(total)))
+
+    # Full H/S bins for near-black and near-white V ranges.
+    frac = float(np.clip(extreme_v_fraction, 0.0, 0.49))
+    edge_span = int(math.ceil(frac * 256.0))
+    if edge_span <= 0:
+        # Explicitly disable extreme-V bins.
+        low_v0, low_v1 = 0, -1
+        high_v0, high_v1 = 256, 255
+    else:
+        low_v0, low_v1 = 0, min(255, edge_span - 1)
+        # Use an inclusive high-side edge that starts at 255-edge_span so edgeV=0.05
+        # yields 242..255 while low side is 0..12.
+        high_v0, high_v1 = max(0, 255 - edge_span), 255
+    rows: list[dict[str, float | int]] = []
+
+    low_mask = (v >= low_v0) & (v <= low_v1)
+    low_count = int(np.count_nonzero(low_mask))
+    if low_count > 0:
+        rows.append(
+            {
+                "hc": 127.5,
+                "sc": 127.5,
+                "vc": float(0.5 * (low_v0 + low_v1)),
+                "count": low_count,
+                "h0": 0,
+                "h1": 255,
+                "s0": 0,
+                "s1": 255,
+                "v0": int(low_v0),
+                "v1": int(low_v1),
+            }
+        )
+
+    high_mask = (v >= high_v0) & (v <= high_v1)
+    high_count = int(np.count_nonzero(high_mask))
+    if high_count > 0:
+        rows.append(
+            {
+                "hc": 127.5,
+                "sc": 127.5,
+                "vc": float(0.5 * (high_v0 + high_v1)),
+                "count": high_count,
+                "h0": 0,
+                "h1": 255,
+                "s0": 0,
+                "s1": 255,
+                "v0": int(high_v0),
+                "v1": int(high_v1),
+            }
+        )
+
+    # Partition the remaining V range into the requested number of middle groups.
+    if edge_span <= 0:
+        mid_lo, mid_hi = 0, 255
+    else:
+        mid_lo, mid_hi = low_v1 + 1, high_v0 - 1
+    middle_groups = max(1, int(v_bins))
+    middle_v_ranges: list[tuple[int, int]] = []
+    if mid_lo <= mid_hi:
+        mid_len = mid_hi - mid_lo + 1
+        for i in range(middle_groups):
+            a = mid_lo + (i * mid_len) // middle_groups
+            b = mid_lo + ((i + 1) * mid_len) // middle_groups - 1
+            a = int(np.clip(a, mid_lo, mid_hi))
+            b = int(np.clip(b, mid_lo, mid_hi))
+            if a <= b:
+                middle_v_ranges.append((a, b))
+
+    if middle_v_ranges:
+        hb = np.clip((h * h_bins) // 256, 0, h_bins - 1)
+        sb = np.clip((s * s_bins) // 256, 0, s_bins - 1)
+
+        for v_idx, (v0, v1) in enumerate(middle_v_ranges):
+            vm = (v >= v0) & (v <= v1)
+            if not np.any(vm):
+                continue
+
+            pb = (np.int64(v_idx) << 40) | (hb[vm].astype(np.int64) << 20) | sb[vm].astype(np.int64)
+            uniq_pb, cnt_pb = np.unique(pb, return_counts=True)
+            for p, c in zip(uniq_pb, cnt_pb):
+                hbi = int((int(p) >> 20) & 0xFFFFF)
+                sbi = int(int(p) & 0xFFFFF)
+                h0 = int(np.clip((hbi * 256) // h_bins, 0, 255))
+                h1 = int(np.clip((((hbi + 1) * 256) // h_bins) - 1, 0, 255))
+                s0 = int(np.clip((sbi * 256) // s_bins, 0, 255))
+                s1 = int(np.clip((((sbi + 1) * 256) // s_bins) - 1, 0, 255))
+                rows.append(
+                    {
+                        "hc": float(0.5 * (h0 + h1)),
+                        "sc": float(0.5 * (s0 + s1)),
+                        "vc": float(0.5 * (v0 + v1)),
+                        "count": int(c),
+                        "h0": h0,
+                        "h1": h1,
+                        "s0": s0,
+                        "s1": s1,
+                        "v0": int(v0),
+                        "v1": int(v1),
+                    }
+                )
+
+    rows.sort(key=lambda row: int(row["count"]), reverse=True)
+    if rows:
+        counts = np.asarray([int(r["count"]) for r in rows], dtype=np.int64)
+        cumulative = np.cumsum(counts)
+        need = int(np.searchsorted(cumulative, target_pixels, side="left") + 1)
+        use_n = int(np.clip(need, 1, min(max_bars, len(rows))))
+        chosen_rows = rows[:use_n]
+        covered_pixels = int(cumulative[use_n - 1])
+    else:
+        chosen_rows = []
+        covered_pixels = 0
+
+    coverage = covered_pixels / float(total) if total > 0 else 0.0
+
+    chosen_meta: dict[str, float | int] = {
+        "coverage": float(coverage),
+        "h_bins": int(h_bins),
+        "s_bins": int(s_bins),
+        "v_bins": int(v_bins),
+        "bars": int(len(chosen_rows)),
+        "occupied_bins": int(len(rows)),
+        "total_pixels": total,
+        "extreme_v_fraction": float(frac),
+        "extreme_v_span": int(edge_span),
+        "mode": "fixed-bins-with-extreme-v",
+    }
+
+    return chosen_rows, chosen_meta
+
+
+def _plot_hsv_region_count_summary(
+    rgb_source: np.ndarray,
+    packed_hsv: np.ndarray,
+    region_union_outside_plus_inner: np.ndarray,
+    region_between_inner_outer: np.ndarray,
+    extreme_v_fraction: float = 0.10,
+    h_bins: int = 24,
+    s_bins: int = 3,
+    v_bins: int = 4,
+) -> None:
+    d1, _top1 = _top_exact_hsv_counts(packed_hsv, region_union_outside_plus_inner, top_k=20)
+    d2, _top2 = _top_exact_hsv_counts(packed_hsv, region_between_inner_outer, top_k=20)
+    vol1, meta1 = _top_hsv_volume_counts(
+        packed_hsv,
+        region_union_outside_plus_inner,
+        coverage_target=0.995,
+        max_bars=144,
+        h_bins=h_bins,
+        s_bins=s_bins,
+        v_bins=v_bins,
+        extreme_v_fraction=extreme_v_fraction,
+    )
+    vol2, meta2 = _top_hsv_volume_counts(
+        packed_hsv,
+        region_between_inner_outer,
+        coverage_target=0.995,
+        max_bars=144,
+        h_bins=h_bins,
+        s_bins=s_bins,
+        v_bins=v_bins,
+        extreme_v_fraction=extreme_v_fraction,
+    )
+
+    print(
+        "HSV distinct values: "
+        f"regionA(outside outer U inside inner)={d1}, "
+        f"regionB(between inner/outer)={d2}"
+    )
+
+    print(
+        "HSV volume coverage: "
+        f"regionA={100.0 * float(meta1['coverage']):.2f}% "
+        f"with fixed bins size=({int(meta1['h_bins'])},{int(meta1['s_bins'])},{int(meta1['v_bins'])}) "
+        f"bars={int(meta1['bars'])}; "
+        f"regionB={100.0 * float(meta2['coverage']):.2f}% "
+        f"with fixed bins size=({int(meta2['h_bins'])},{int(meta2['s_bins'])},{int(meta2['v_bins'])}) "
+        f"bars={int(meta2['bars'])}; "
+        f"edgeV={float(meta1.get('extreme_v_fraction', 0.0)):.3f}."
+    )
+
+    # Keep this figure screen-friendly while showing charts side by side.
+    fig, axs = plt.subplots(1, 2, figsize=(15, 8), constrained_layout=True)
+    ax1, ax2 = axs[0], axs[1]
+
+    h_u8 = ((packed_hsv >> 16) & 0xFF).astype(np.uint8)
+    s_u8 = ((packed_hsv >> 8) & 0xFF).astype(np.uint8)
+    v_u8 = (packed_hsv & 0xFF).astype(np.uint8)
+
+    def _show_hsv_match_window(row: dict[str, float | int], region_mask: np.ndarray, chart_title: str) -> None:
+        h0, h1 = int(row["h0"]), int(row["h1"])
+        s0, s1 = int(row["s0"]), int(row["s1"])
+        v0, v1 = int(row["v0"]), int(row["v1"])
+        hsv_match = (
+            (h_u8 >= h0) & (h_u8 <= h1)
+            & (s_u8 >= s0) & (s_u8 <= s1)
+            & (v_u8 >= v0) & (v_u8 <= v1)
+        )
+        show_mask = hsv_match & region_mask
+        out = np.ones_like(rgb_source, dtype=np.float32)
+        out[show_mask] = rgb_source[show_mask]
+
+        fig_match, ax_match = plt.subplots(1, 1, figsize=(8, 6), constrained_layout=True)
+        ax_match.imshow(out, interpolation="nearest")
+        ax_match.set_title(
+            f"{chart_title}\n"
+            f"H[{h0}-{h1}] S[{s0}-{s1}] V[{v0}-{v1}]  matched={int(np.count_nonzero(show_mask))}"
+        )
+        ax_match.set_xticks([])
+        ax_match.set_yticks([])
+        plt.show(block=False)
+        plt.pause(0.001)
+
+    def _attach_bar_hover_tooltips(
+        ax,
+        bars,
+        labels: list[str],
+        rows: list[dict[str, float | int]],
+        region_mask: np.ndarray,
+        chart_title: str,
+    ) -> None:
+        annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(12, 12),
+            textcoords="offset points",
+            bbox={"boxstyle": "round", "fc": "black", "ec": "white", "alpha": 0.85},
+            color="white",
+            fontsize=8,
+            zorder=10,
+        )
+        annot.set_visible(False)
+
+        def _on_move(event):
+            if event.inaxes != ax:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    fig.canvas.draw_idle()
+                return
+
+            for i, bar in enumerate(bars):
+                hit, _ = bar.contains(event)
+                if hit:
+                    x = event.xdata if event.xdata is not None else float(bar.get_width())
+                    y = event.ydata if event.ydata is not None else float(bar.get_y() + 0.5 * bar.get_height())
+                    annot.xy = (x, y)
+                    annot.set_text(labels[i])
+                    if not annot.get_visible():
+                        annot.set_visible(True)
+                    fig.canvas.draw_idle()
+                    return
+
+            if annot.get_visible():
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+
+        def _on_click(event):
+            if event.inaxes != ax or getattr(event, "button", None) != 1:
+                return
+            for i, bar in enumerate(bars):
+                hit, _ = bar.contains(event)
+                if hit:
+                    _show_hsv_match_window(rows[i], region_mask, chart_title)
+                    return
+
+        fig.canvas.mpl_connect("motion_notify_event", _on_move)
+        fig.canvas.mpl_connect("button_press_event", _on_click)
+
+    def _plot_vol(
+        ax,
+        title: str,
+        rows: list[dict[str, float | int]],
+        meta: dict[str, float | int],
+        region_mask: np.ndarray,
+    ):
+        if not rows:
+            ax.set_title(f"{title}\n(no pixels)")
+            ax.axis("off")
+            return
+        counts = np.asarray([int(row["count"]) for row in rows], dtype=np.int64)
+        plot_counts = np.log10(np.maximum(counts, 1))
+        colors = [
+            hsv_to_rgb(
+                np.array(
+                    [
+                        np.clip(float(row["hc"]) / 255.0, 0.0, 1.0),
+                        np.clip(float(row["sc"]) / 255.0, 0.0, 1.0),
+                        np.clip(float(row["vc"]) / 255.0, 0.0, 1.0),
+                    ],
+                    dtype=np.float32,
+                )
+            )
+            for row in rows
+        ]
+        y = np.arange(len(rows))
+        bars = ax.barh(y, plot_counts, color=colors, alpha=0.95, edgecolor="black", linewidth=0.6)
+        ax.set_yticks([])
+        ax.invert_yaxis()
+        ax.set_xlabel("log10(count)")
+        ax.set_title(
+            f"{title}\n"
+            f"Fixed HSV bins: coverage={100.0 * float(meta['coverage']):.2f}% "
+            f"size(H,S,V)=({int(meta['h_bins'])},{int(meta['s_bins'])},{int(meta['v_bins'])}), "
+            f"bars={int(meta['bars'])}, edgeV={float(meta.get('extreme_v_fraction', 0.0)):.3f}"
+        )
+        ax.grid(True, axis="x", alpha=0.25)
+        labels = [
+            (
+                f"H[{int(row['h0'])}-{int(row['h1'])}] "
+                f"S[{int(row['s0'])}-{int(row['s1'])}] "
+                f"V[{int(row['v0'])}-{int(row['v1'])}]\n"
+                f"count={int(row['count'])} (click to show pixels)"
+            )
+            for row in rows
+        ]
+        _attach_bar_hover_tooltips(ax, bars, labels, rows, region_mask, title)
+
+    _plot_vol(ax1, "Region A: outside outer U inside inner", vol1, meta1, region_union_outside_plus_inner)
+    _plot_vol(ax2, "Region B: between inner and outer", vol2, meta2, region_between_inner_outer)
+    fig.suptitle(
+        "HSV volume-count summaries by spline-defined regions\n"
+        f"exact distinct counts: regionA={d1}, regionB={d2}"
+    )
+    # Render summary window without blocking; final blocking show occurs in _show_map.
+    plt.show(block=False)
+    plt.pause(0.001)
+
+
 def make_gaussian_window(size: int = 265, softness: float = 0.2) -> np.ndarray:
     # Match the window behavior used in the explorer: normalized coords over full width/height.
     half = size / 2.0
@@ -1194,6 +1705,39 @@ def main() -> None:
         help="Exponent for near100 scaling; smaller values increase detail near 100 (default: 0.25)",
     )
     parser.add_argument(
+        "--trace-threshold",
+        type=float,
+        default=99.0,
+        help="Threshold used for tracer HIGH/LOW state criterion (default: 99.0)",
+    )
+    parser.add_argument(
+        "--extreme-v-fraction",
+        type=float,
+        default=0.05,
+        help=(
+            "Fraction of V range near black/white treated as full H/S coverage "
+            "in fixed HSV bins (default: 0.05)."
+        ),
+    )
+    parser.add_argument(
+        "--hsv-h-bins",
+        type=int,
+        default=24,
+        help="Number of H bins for fixed HSV volumes (default: 24).",
+    )
+    parser.add_argument(
+        "--hsv-s-bins",
+        type=int,
+        default=3,
+        help="Number of S bins for fixed HSV volumes (default: 3).",
+    )
+    parser.add_argument(
+        "--hsv-v-bins",
+        type=int,
+        default=4,
+        help="Number of V bins for fixed HSV volumes (default: 4).",
+    )
+    parser.add_argument(
         "--trace-debug-start-outer",
         type=int,
         default=-1,
@@ -1219,6 +1763,11 @@ def main() -> None:
     window_size = max(8, int(args.window_size))
     display_scale = args.display_scale
     near100_alpha = max(0.05, float(args.near100_alpha))
+    extreme_v_fraction = float(np.clip(args.extreme_v_fraction, 0.0, 0.49))
+    hsv_h_bins = max(1, int(args.hsv_h_bins))
+    hsv_s_bins = max(1, int(args.hsv_s_bins))
+    hsv_v_bins = max(1, int(args.hsv_v_bins))
+    trace_threshold = float(np.clip(args.trace_threshold, 0.0, 100.0))
     trace_debug_start_outer: int | None = (
         int(args.trace_debug_start_outer) if int(args.trace_debug_start_outer) >= 0 else None
     )
@@ -1323,6 +1872,11 @@ def main() -> None:
         window_size=win_size,
         display_scale=display_scale,
         near100_alpha=near100_alpha,
+        extreme_v_fraction=extreme_v_fraction,
+        hsv_h_bins=hsv_h_bins,
+        hsv_s_bins=hsv_s_bins,
+        hsv_v_bins=hsv_v_bins,
+        trace_threshold=trace_threshold,
         trace_debug_start_outer=trace_debug_start_outer,
         trace_debug_start_inner=trace_debug_start_inner,
     )
@@ -1339,10 +1893,27 @@ def _show_map(
     window_size: int,
     display_scale: str,
     near100_alpha: float,
+    extreme_v_fraction: float,
+    hsv_h_bins: int,
+    hsv_s_bins: int,
+    hsv_v_bins: int,
+    trace_threshold: float,
     trace_debug_start_outer: int | None,
     trace_debug_start_inner: int | None,
 ) -> None:
     deferred_error: str | None = None
+    t0 = time.perf_counter()
+    # Keep a pristine copy for HSV counting so plotted spline overlays are never sampled.
+    rgb_source = np.asarray(rgb, dtype=np.float32).copy()
+
+    def _dbg(msg: str) -> None:
+        dt = time.perf_counter() - t0
+        print(f"[_show_map +{dt:8.3f}s] {msg}", flush=True)
+
+    _dbg(
+        "enter: "
+        f"metric={metric}, display_scale={display_scale}, out_shape={tuple(out.shape)}, rgb_shape={tuple(rgb_source.shape)}"
+    )
 
     if metric == "hp_removed":
         disp = np.clip(out, 0.0, 100.0)
@@ -1380,26 +1951,38 @@ def _show_map(
         constrained_layout=True,
     )
 
-    ax_src.imshow(rgb, interpolation="nearest")
+    ax_src.imshow(rgb_source, interpolation="nearest")
     ax_src.set_title("Original image")
+    h_img, w_img = out.shape
+    fixed_xlim = (-0.5, float(w_img) - 0.5)
+    fixed_ylim = (float(h_img) - 0.5, -0.5)
+    ax_src.set_xlim(*fixed_xlim)
+    ax_src.set_ylim(*fixed_ylim)
+    # Keep shared axes pinned to image bounds so line plots cannot autoscale
+    # the view and wash out the map panel.
+    ax_src.set_autoscale_on(False)
+    ax_map.set_autoscale_on(False)
 
     if metric == "hp_removed":
+        _dbg("begin hp_removed tracing block")
         trace_step = max(1, int(step))
-        trace_threshold = 99.0
         ys_step, xs_step, coarse_step, hi_step = _build_step_grid(
             out,
             step=trace_step,
             threshold=trace_threshold,
         )
+        _dbg(f"step-grid built: coarse_shape={tuple(coarse_step.shape)}, trace_step={trace_step}")
         outer_start, _ = _find_centerline_start(
             coarse=coarse_step,
             hi=hi_step,
             ys=ys_step,
             xs=xs_step,
         )
+        _dbg(f"outer_start={outer_start}")
 
         traced_outer = None
         if outer_start is not None:
+            _dbg("calling outer tracer")
             traced_outer = _trace_outer_spline_step_cells(
                 out,
                 step=trace_step,
@@ -1409,11 +1992,16 @@ def _show_map(
                 debug_start_point=trace_debug_start_outer,
                 start_point=outer_start,
                 spline_label="outer",
+                return_partial_on_stop=True,
             )
+            _dbg(f"outer tracer returned shape={np.asarray(traced_outer).shape}")
+        traced_outer = _normalize_closed_spline_xy(traced_outer, min_open_points=300)
         if traced_outer is not None:
+            print(f"Outer spline points: {traced_outer.shape[0]}")
             ax_src.plot(traced_outer[:, 0], traced_outer[:, 1], color="white", linewidth=2.0, alpha=0.95)
 
         if outer_start is not None:
+            _dbg("searching inner_start from outer point 0")
             inner_start = _find_inner_start_from_outer_point0(
                 raw_map=out,
                 step=trace_step,
@@ -1423,7 +2011,9 @@ def _show_map(
                 xs=xs_step,
                 coarse=coarse_step,
             )
+            _dbg(f"inner_start={inner_start}")
             if inner_start is not None:
+                _dbg("calling inner tracer")
                 traced_inner = _trace_outer_spline_step_cells(
                     out,
                     step=trace_step,
@@ -1435,7 +2025,10 @@ def _show_map(
                     spline_label="inner",
                     return_partial_on_stop=True,
                 )
+                _dbg(f"inner tracer returned shape={np.asarray(traced_inner).shape}")
+                traced_inner = _normalize_closed_spline_xy(traced_inner, min_open_points=300)
                 if traced_inner is not None:
+                    print(f"Inner spline points: {traced_inner.shape[0]}")
                     ax_src.plot(traced_inner[:, 0], traced_inner[:, 1], color="cyan", linewidth=1.8, alpha=0.95)
                     centerline = _build_centerline_spline(traced_outer, traced_inner)
                     if centerline is not None:
@@ -1450,15 +2043,68 @@ def _show_map(
                             linewidth=1.6,
                             alpha=0.95,
                         )
+
+                    # HSV counting over requested spline-defined regions.
+                    outer_xy = _normalize_closed_spline_xy(traced_outer, min_open_points=300)
+                    inner_xy = _normalize_closed_spline_xy(traced_inner, min_open_points=300)
+                    if outer_xy is not None and inner_xy is not None:
+                        inside_outer = _mask_inside_closed_spline((out.shape[0], out.shape[1]), outer_xy)
+                        inside_inner = _mask_inside_closed_spline((out.shape[0], out.shape[1]), inner_xy)
+                        region_between_inner_outer = inside_outer & (~inside_inner)
+                        region_union_outside_plus_inner = (~inside_outer) | inside_inner
+                        packed_hsv = _packed_hsv_from_rgb(rgb_source)
+                        _dbg("calling _plot_hsv_region_count_summary (this opens a blocking figure)")
+                        _plot_hsv_region_count_summary(
+                            rgb_source=rgb_source,
+                            packed_hsv=packed_hsv,
+                            region_union_outside_plus_inner=region_union_outside_plus_inner,
+                            region_between_inner_outer=region_between_inner_outer,
+                            extreme_v_fraction=extreme_v_fraction,
+                            h_bins=hsv_h_bins,
+                            s_bins=hsv_s_bins,
+                            v_bins=hsv_v_bins,
+                        )
+                        _dbg("returned from _plot_hsv_region_count_summary")
+                    else:
+                        print(
+                            "HSV count summary skipped: spline geometry could not be coerced to Nx2 "
+                            f"(outer shape={np.asarray(traced_outer).shape}, inner shape={np.asarray(traced_inner).shape})."
+                        )
+
                     if traced_outer is not None and _spline_intersects(traced_outer, traced_inner):
                         deferred_error = (
                             "Error: inner spline intersects outer spline. "
                             "Inner/outer spline intersection is not allowed."
                         )
                         print(deferred_error)
+                _dbg("end hp_removed tracing block")
 
+    disp64 = np.asarray(disp, dtype=np.float64)
+    finite_mask = np.isfinite(disp64)
+    finite_count = int(np.count_nonzero(finite_mask))
+    total_count = int(disp64.size)
+    if finite_count == 0:
+        raise RuntimeError("disp validation failed: no finite values available for map display")
+
+    disp_finite = disp64[finite_mask]
+    dmin = float(np.min(disp_finite))
+    dmax = float(np.max(disp_finite))
+    dmean = float(np.mean(disp_finite))
+    p01, p50, p99 = np.percentile(disp_finite, [1.0, 50.0, 99.0]).astype(float)
+    in_vrange = float(np.mean((disp_finite >= float(vmin)) & (disp_finite <= float(vmax))))
+    print(
+        "disp validation: "
+        f"finite={finite_count}/{total_count}, "
+        f"min={dmin:.6f}, p01={p01:.6f}, p50={p50:.6f}, p99={p99:.6f}, max={dmax:.6f}, "
+        f"mean={dmean:.6f}, in_vrange={100.0 * in_vrange:.2f}%"
+    )
+
+    _dbg("entering ax_map.imshow")
     im = ax_map.imshow(disp, cmap="magma", vmin=vmin, vmax=vmax, interpolation="nearest")
+    _dbg("ax_map.imshow returned")
     ax_map.set_title("FFT-derived map")
+    ax_map.set_xlim(*fixed_xlim)
+    ax_map.set_ylim(*fixed_ylim)
 
     h, w = out.shape
 
@@ -1477,6 +2123,9 @@ def _show_map(
     # Keep toolbar readout useful when non-linear display scaling is active.
     ax_map.format_coord = _fmt_xy_values
     ax_src.format_coord = _fmt_xy_values
+    # Explicit cursor-data formatting helps newer Matplotlib toolbars include
+    # value readouts on image artists.
+    ax_map.format_cursor_data = lambda data: f"{float(data):.3f}" if np.isscalar(data) else str(data)
 
     cbar = fig.colorbar(im, ax=ax_map, label=cbar_label, fraction=0.046, pad=0.04)
     cbar.set_ticks(ticks)
@@ -1489,10 +2138,21 @@ def _show_map(
         f"processed={processed}/{total}"
     )
 
-    ax_src.axis("off")
-    ax_map.axis("off")
+    # Avoid axis("off") because some backends drop rich cursor readouts on hidden axes.
+    for ax in (ax_src, ax_map):
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    # Re-assert after axis styling to avoid backend-specific formatter resets.
+    ax_map.format_coord = _fmt_xy_values
+    ax_src.format_coord = _fmt_xy_values
+    _dbg("calling final plt.show (blocking until figure closes)")
     plt.show()
+    _dbg("returned from final plt.show")
     if deferred_error is not None:
+        _dbg("raising deferred intersection RuntimeError")
         raise RuntimeError(deferred_error)
 
 
