@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Scan an image with local Gaussian-windowed FFT and map a local FFT metric.
+"""Load a saved map and compute spline overlays.
 
-The scan samples the image on a stride grid (default step=10), prints an
-estimated CPU time before processing, and shows progress markers when the
-estimated runtime is greater than 15 seconds.
+This script reads the original image, a precomputed map (.npy), and metadata
+(.json), computes outer/inner/centerline splines, writes spline geometry to
+JSON, and displays the original image + map with splines overlaid on both.
 """
+
+# Suggested commands:
+# python map_from_fft.py beads-photo-2.jpg
+# python find_splines.py beads-photo-2_map.npy beads-photo-2_map_metadata.json
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import time
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1326,186 +1332,113 @@ def nearest_coord_indices(length: int, coords: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Map local FFT metric using 200x200 Gaussian-windowed FFT."
+        description="Load a saved map+metadata, compute splines, save spline JSON, and render overlays."
     )
-    parser.add_argument("image", help="Input image path")
+    parser.add_argument("map", help="Path to map .npy file created by map_from_fft.py")
+    parser.add_argument("metadata", help="Path to metadata .json created by map_from_fft.py")
     parser.add_argument(
-        "--highpass-percent",
-        type=float,
-        default=8.0,
-        help="High-pass radius percentage (0..100), same meaning as in fft_image_explorer.py (default: 8)",
-    )
-    parser.add_argument(
-        "--metric",
-        choices=["hp_removed", "first_non_origin_peak"],
-        default="hp_removed",
-        help="Metric to map (default: hp_removed)",
+        "--image",
+        default=None,
+        help="Optional override path for the original image (defaults to metadata image_path).",
     )
     parser.add_argument(
-        "--step",
-        type=int,
-        default=8,
-        help="Stride in pixels for sampling (default: 8)",
-    )
-    parser.add_argument(
-        "--window-size",
-        type=int,
-        default=200,
-        help="Gaussian FFT window size in pixels (default: 200)",
-    )
-    parser.add_argument(
-        "--display-scale",
-        choices=["linear", "near100"],
-        default="near100",
-        help="Color scaling for output map (default: near100)",
-    )
-    parser.add_argument(
-        "--near100-alpha",
-        type=float,
-        default=0.25,
-        help="Exponent for near100 scaling; smaller values increase detail near 100 (default: 0.25)",
+        "--spline-out",
+        default=None,
+        help="Path for writing computed spline geometry (.json). Default: <image_name>_splines.json",
     )
     parser.add_argument(
         "--trace-threshold",
         type=float,
-        default=99.0,
-        help="Threshold used for tracer HIGH/LOW state criterion (default: 99.0)",
+        default=None,
+        help="Override trace threshold. Default uses metadata value.",
     )
     parser.add_argument(
         "--trace-debug-start-outer",
         type=int,
-        default=-1,
-        help=(
-            "Emit full per-candidate trace debug from this outer-spline-point index onward; "
-            "default: off."
-        ),
+        default=None,
+        help="Optional debug start index for outer tracer.",
     )
     parser.add_argument(
         "--trace-debug-start-inner",
         type=int,
-        default=-1,
-        help=(
-            "Emit full per-candidate trace debug from this inner-spline-point index onward; "
-            "default: off."
-        ),
+        default=None,
+        help="Optional debug start index for inner tracer.",
     )
     args = parser.parse_args()
 
-    hp_percent = float(np.clip(args.highpass_percent, 0.0, 100.0))
-    metric = args.metric
-    step = max(1, int(args.step))
-    window_size = max(8, int(args.window_size))
-    display_scale = args.display_scale
-    near100_alpha = max(0.05, float(args.near100_alpha))
-    trace_threshold = float(np.clip(args.trace_threshold, 0.0, 100.0))
+    map_path = Path(args.map).expanduser().resolve()
+    meta_path = Path(args.metadata).expanduser().resolve()
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    image_path = Path(args.image).expanduser().resolve() if args.image else Path(meta["image_path"]).expanduser().resolve()
+    image_stem = image_path.stem
+    spline_out_path = (
+        Path(args.spline_out).expanduser().resolve()
+        if args.spline_out
+        else (Path.cwd() / f"{image_stem}_splines.json").resolve()
+    )
+    rgb, _ = load_image_and_luminance(str(image_path))
+    out = np.load(map_path).astype(np.float32)
+
+    if rgb.shape[:2] != out.shape:
+        raise RuntimeError(
+            f"Shape mismatch: image shape={rgb.shape[:2]} vs map shape={out.shape}. "
+            "Use --image to point to the matching source image."
+        )
+
+    hp_percent = float(meta.get("highpass_percent", 8.0))
+    metric = str(meta.get("metric", "hp_removed"))
+    step = int(meta.get("step", 1))
+    window_size = int(meta.get("window_size", 0))
+    display_scale = str(meta.get("display_scale", "near100"))
+    near100_alpha = float(meta.get("near100_alpha", 0.25))
+    processed = int(meta.get("processed", int(out.size)))
+    total = int(meta.get("total", int(out.size)))
+
+    trace_threshold = (
+        float(np.clip(args.trace_threshold, 0.0, 100.0))
+        if args.trace_threshold is not None
+        else float(np.clip(float(meta.get("trace_threshold", 99.0)), 0.0, 100.0))
+    )
     trace_debug_start_outer: int | None = (
-        int(args.trace_debug_start_outer) if int(args.trace_debug_start_outer) >= 0 else None
+        int(args.trace_debug_start_outer)
+        if args.trace_debug_start_outer is not None and int(args.trace_debug_start_outer) >= 0
+        else meta.get("trace_debug_start_outer")
     )
     trace_debug_start_inner: int | None = (
-        int(args.trace_debug_start_inner) if int(args.trace_debug_start_inner) >= 0 else None
-    )
-    rgb, y = load_image_and_luminance(args.image)
-    h, w = y.shape
-
-    win_size = window_size
-    softness = 0.2
-    window = make_gaussian_window(size=win_size, softness=softness)
-
-    # Edge padding so every image pixel can be used as a window center.
-    pad = win_size // 2
-    y_pad = np.pad(y, ((pad, pad), (pad, pad)), mode="edge")
-
-    # High-pass mask for a fixed local FFT grid.
-    fh = fw = win_size
-    fcy, fcx = fh // 2, fw // 2
-    yy, xx = np.ogrid[:fh, :fw]
-    max_radius_px = math.hypot(fh / 2.0, fw / 2.0)
-    hp_radius_px = hp_percent * 0.01 * max_radius_px
-    low_freq_mask = (yy - fcy) ** 2 + (xx - fcx) ** 2 <= hp_radius_px ** 2
-    hp_keep_mask = ~low_freq_mask
-
-    def eval_metric_at(iy: int, ix: int) -> float:
-        patch = y_pad[iy:iy + win_size, ix:ix + win_size]
-        patch_w = patch * window
-        f = np.fft.fftshift(np.fft.fft2(patch_w))
-        base_power = float((np.abs(f) ** 2).sum())
-
-        if base_power <= 1e-12:
-            return 0.0
-        if metric == "hp_removed":
-            hp_only_power = float((np.abs(f * hp_keep_mask) ** 2).sum())
-            return 100.0 * (base_power - hp_only_power) / base_power
-
-        mag_raw = np.log1p(np.abs(f))
-        peaks = find_top_fft_peaks(mag_raw)
-        for p in peaks:
-            if float(p.get("distance", 0.0)) > 0.0:
-                return float(p.get("peak_val", 0.0))
-        return 0.0
-
-    ys = np.arange(0, h, step, dtype=np.int32)
-    xs = np.arange(0, w, step, dtype=np.int32)
-    ly_n = int(ys.shape[0])
-    lx_n = int(xs.shape[0])
-    total = ly_n * lx_n
-
-    calib_n = min(200, total)
-    calib_ids = np.linspace(0, max(total - 1, 0), num=calib_n, dtype=np.int64)
-    t_cal0 = time.process_time()
-    for fid in calib_ids:
-        iy = int(ys[int(fid // lx_n)])
-        ix = int(xs[int(fid % lx_n)])
-        _ = eval_metric_at(iy, ix)
-    t_cal = time.process_time() - t_cal0
-    pps_est = calib_n / max(t_cal, 1e-9)
-    est_cpu_s = total / max(pps_est, 1e-9)
-    print(
-        f"Estimated CPU time: {est_cpu_s:.3f}s "
-        f"for {total} points (step={step}) at ~{pps_est:.1f} points/sec CPU"
+        int(args.trace_debug_start_inner)
+        if args.trace_debug_start_inner is not None and int(args.trace_debug_start_inner) >= 0
+        else meta.get("trace_debug_start_inner")
     )
 
-    show_progress = est_cpu_s > 15.0
-    next_progress_pct = 5
-
-    lattice_vals = np.zeros((ly_n, lx_n), dtype=np.float32)
-    t_run0 = time.process_time()
-    done = 0
-    for ly, iy in enumerate(ys):
-        for lx, ix in enumerate(xs):
-            lattice_vals[ly, lx] = eval_metric_at(int(iy), int(ix))
-            done += 1
-            if show_progress:
-                pct = int((100.0 * done) / max(total, 1))
-                while pct >= next_progress_pct and next_progress_pct <= 100:
-                    print(f"Progress: {next_progress_pct}% ({done}/{total})")
-                    next_progress_pct += 5
-
-    cpu_elapsed = time.process_time() - t_run0
-    pps = done / max(cpu_elapsed, 1e-9)
-
-    ny = nearest_coord_indices(h, ys.astype(np.float32))
-    nx = nearest_coord_indices(w, xs.astype(np.float32))
-    out = lattice_vals[ny[:, None], nx[None, :]].copy()
-
-    print(
-        f"Completed stride scan: CPU time {cpu_elapsed:.3f}s, "
-        f"processed={done}/{total}, step={step}, {pps:.1f} points/sec CPU"
-    )
-    _show_map(
+    spline_data = _show_map(
         rgb,
         out,
         hp_percent,
         metric=metric,
-        processed=done,
+        processed=processed,
         total=total,
         step=step,
-        window_size=win_size,
+        window_size=window_size,
         display_scale=display_scale,
         near100_alpha=near100_alpha,
         trace_threshold=trace_threshold,
         trace_debug_start_outer=trace_debug_start_outer,
         trace_debug_start_inner=trace_debug_start_inner,
     )
+
+    output = {
+        "version": 1,
+        "image_path": str(image_path),
+        "map_path": str(map_path),
+        "metadata_path": str(meta_path),
+        "trace_threshold": float(trace_threshold),
+        "outer_spline": spline_data.get("outer"),
+        "inner_spline": spline_data.get("inner"),
+        "centerline_spline": spline_data.get("centerline"),
+        "inner_intersects_outer": bool(spline_data.get("intersects", False)),
+    }
+    spline_out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    print(f"Wrote spline file: {spline_out_path}")
 
 
 def _show_map(
@@ -1522,7 +1455,7 @@ def _show_map(
     trace_threshold: float,
     trace_debug_start_outer: int | None,
     trace_debug_start_inner: int | None,
-) -> None:
+) -> dict[str, object]:
     deferred_error: str | None = None
     t0 = time.perf_counter()
     # Keep a pristine copy for HSV counting so plotted spline overlays are never sampled.
@@ -1585,6 +1518,11 @@ def _show_map(
     ax_src.set_autoscale_on(False)
     ax_map.set_autoscale_on(False)
 
+    traced_outer = None
+    traced_inner = None
+    centerline = None
+    intersects = False
+
     if metric == "hp_removed":
         _dbg("begin hp_removed tracing block")
         trace_step = max(1, int(step))
@@ -1602,7 +1540,6 @@ def _show_map(
         )
         _dbg(f"outer_start={outer_start}")
 
-        traced_outer = None
         if outer_start is not None:
             _dbg("calling outer tracer")
             traced_outer = _trace_outer_spline_step_cells(
@@ -1620,7 +1557,8 @@ def _show_map(
         traced_outer = _normalize_closed_spline_xy(traced_outer, min_open_points=300)
         if traced_outer is not None:
             print(f"Outer spline points: {traced_outer.shape[0]}")
-            ax_src.plot(traced_outer[:, 0], traced_outer[:, 1], color="white", linewidth=2.0, alpha=0.95)
+            for ax in (ax_src, ax_map):
+                ax.plot(traced_outer[:, 0], traced_outer[:, 1], color="white", linewidth=2.0, alpha=0.95)
 
         if outer_start is not None:
             _dbg("searching inner_start from outer point 0")
@@ -1651,22 +1589,25 @@ def _show_map(
                 traced_inner = _normalize_closed_spline_xy(traced_inner, min_open_points=300)
                 if traced_inner is not None:
                     print(f"Inner spline points: {traced_inner.shape[0]}")
-                    ax_src.plot(traced_inner[:, 0], traced_inner[:, 1], color="cyan", linewidth=1.8, alpha=0.95)
+                    for ax in (ax_src, ax_map):
+                        ax.plot(traced_inner[:, 0], traced_inner[:, 1], color="cyan", linewidth=1.8, alpha=0.95)
                     centerline = _build_centerline_spline(traced_outer, traced_inner)
                     if centerline is not None:
                         print(
                             "Centerline spline: built midpoint curve from outer/inner splines; "
                             f"samples={centerline.shape[0]}"
                         )
-                        ax_src.plot(
-                            centerline[:, 0],
-                            centerline[:, 1],
-                            color="yellow",
-                            linewidth=1.6,
-                            alpha=0.95,
-                        )
+                        for ax in (ax_src, ax_map):
+                            ax.plot(
+                                centerline[:, 0],
+                                centerline[:, 1],
+                                color="yellow",
+                                linewidth=1.6,
+                                alpha=0.95,
+                            )
 
                     if traced_outer is not None and _spline_intersects(traced_outer, traced_inner):
+                        intersects = True
                         deferred_error = (
                             "Error: inner spline intersects outer spline. "
                             "Inner/outer spline intersection is not allowed."
@@ -1749,6 +1690,18 @@ def _show_map(
     if deferred_error is not None:
         _dbg("raising deferred intersection RuntimeError")
         raise RuntimeError(deferred_error)
+
+    def _curve_to_json(curve: np.ndarray | None) -> list[list[float]] | None:
+        if curve is None:
+            return None
+        return [[float(p[0]), float(p[1])] for p in np.asarray(curve, dtype=np.float64)]
+
+    return {
+        "outer": _curve_to_json(traced_outer),
+        "inner": _curve_to_json(traced_inner),
+        "centerline": _curve_to_json(centerline),
+        "intersects": bool(intersects),
+    }
 
 
 if __name__ == "__main__":
