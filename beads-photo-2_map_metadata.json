@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "image_path": "/home/rharris/git/fft-image-explorer/beads-photo-2.jpg",
+  "map_path": "/home/rharris/git/fft-image-explorer/beads-photo-2_map.npy",
+  "metric": "hp_removed",
+  "highpass_percent": 8.0,
+  "step": 8,
+  "window_size": 128,
+  "display_scale": "near100",
+  "near100_alpha": 0.25,
+  "processed": 126564,
+  "total": 126564,
+  "map_shape": [
+    3182,
+    2540
+  ]
+}
