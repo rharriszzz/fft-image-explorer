@@ -8,6 +8,7 @@ JSON, and displays the original image + map with splines overlaid on both.
 
 # Suggested commands:
 # python map_from_fft.py beads-photo-2.jpg
+# python find_splines.py beads-photo-2.jpg
 # python find_splines.py beads-photo-2_map.npy beads-photo-2_map_metadata.json
 
 from __future__ import annotations
@@ -1334,8 +1335,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Load a saved map+metadata, compute splines, save spline JSON, and render overlays."
     )
-    parser.add_argument("map", help="Path to map .npy file created by map_from_fft.py")
-    parser.add_argument("metadata", help="Path to metadata .json created by map_from_fft.py")
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        help=(
+            "Either: <image_path> to auto-resolve map/metadata names, "
+            "or: <map.npy> <metadata.json>"
+        ),
+    )
     parser.add_argument(
         "--image",
         default=None,
@@ -1366,8 +1373,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    map_path = Path(args.map).expanduser().resolve()
-    meta_path = Path(args.metadata).expanduser().resolve()
+    if len(args.inputs) == 1:
+        image_input_path = Path(args.inputs[0]).expanduser().resolve()
+        image_stem = image_input_path.stem
+        map_path = (Path.cwd() / f"{image_stem}_map.npy").resolve()
+        meta_path = (Path.cwd() / f"{image_stem}_map_metadata.json").resolve()
+    elif len(args.inputs) == 2:
+        map_path = Path(args.inputs[0]).expanduser().resolve()
+        meta_path = Path(args.inputs[1]).expanduser().resolve()
+    else:
+        parser.error("Provide either 1 argument (<image_path>) or 2 arguments (<map.npy> <metadata.json>).")
+
+    if not map_path.exists():
+        raise FileNotFoundError(f"Map file not found: {map_path}")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Metadata file not found: {meta_path}")
+
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     image_path = Path(args.image).expanduser().resolve() if args.image else Path(meta["image_path"]).expanduser().resolve()
     image_stem = image_path.stem

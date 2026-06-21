@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Standalone HSV fixed-bin pixel counter and interactive visualizer.
+"""Standalone HSV pixel counter and visualizer.
 
 This script is intentionally independent from other local Python files.
-It loads an image, computes packed HSV values, counts pixels in fixed HSV bins,
-and shows an interactive bar chart. Clicking a bar opens a window that shows only
-pixels matching that HSV bin, with all other pixels set to white.
+It loads an image, computes packed HSV values, and can either:
+1) count pixels in fixed HSV bins (interactive), or
+2) count exact unique HSV values in a spline-derived region and plot log-counts.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
+from matplotlib.path import Path as MplPath
 from PIL import Image, ImageOps
 
 
@@ -32,6 +35,218 @@ def packed_hsv_from_rgb(rgb: np.ndarray) -> np.ndarray:
     s = hsv_u8[..., 1].astype(np.uint32)
     v = hsv_u8[..., 2].astype(np.uint32)
     return (h << 16) | (s << 8) | v
+
+
+def _coerce_closed_curve_xy(curve_xy: object) -> np.ndarray | None:
+    arr = np.asarray(curve_xy, dtype=np.float64)
+    if arr.size == 0:
+        return None
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 3:
+        return None
+    if np.hypot(*(arr[0] - arr[-1])) > 1e-9:
+        arr = np.vstack([arr, arr[0]])
+    return arr
+
+
+def _inside_polygon_mask(shape: tuple[int, int], curve_xy: np.ndarray) -> np.ndarray:
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    points = np.column_stack([xx.ravel(), yy.ravel()])
+    inside = MplPath(curve_xy).contains_points(points, radius=1e-9)
+    return inside.reshape(h, w)
+
+
+def _spline_region_mask(packed_hsv: np.ndarray, spline_json_path: str) -> np.ndarray:
+    data = json.loads(Path(spline_json_path).read_text(encoding="utf-8"))
+    outer_curve = _coerce_closed_curve_xy(data.get("outer_spline"))
+    inner_curve = _coerce_closed_curve_xy(data.get("inner_spline"))
+    if outer_curve is None:
+        raise RuntimeError("Spline JSON does not contain a valid outer_spline.")
+    if inner_curve is None:
+        raise RuntimeError("Spline JSON does not contain a valid inner_spline.")
+
+    shape = packed_hsv.shape
+    inside_outer = _inside_polygon_mask(shape, outer_curve)
+    inside_inner = _inside_polygon_mask(shape, inner_curve)
+
+    # Region requested by user: pixels outside outer OR inside inner.
+    return (~inside_outer) | inside_inner
+
+
+def plot_exact_hsv_counts_log(packed_hsv: np.ndarray, mask: np.ndarray, title: str) -> None:
+    # Exclude the dominant HSV box before exact counting.
+    # Requested exclusion: H 219..242, S 100..180, V 88..250.
+    h_u8_full = ((packed_hsv >> 16) & 0xFF).astype(np.uint8)
+    s_u8_full = ((packed_hsv >> 8) & 0xFF).astype(np.uint8)
+    v_u8_full = (packed_hsv & 0xFF).astype(np.uint8)
+    excluded_box = (
+        (h_u8_full >= 219) & (h_u8_full <= 242)
+        & (s_u8_full >= 100) & (s_u8_full <= 200)
+        & (v_u8_full >= 80) & (v_u8_full <= 250)
+    )
+
+    effective_mask = mask & (~excluded_box)
+    vals = packed_hsv[effective_mask]
+    if vals.size == 0:
+        print("No pixels selected by mask.")
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6), constrained_layout=True)
+        ax.set_title(title + "\n(no selected pixels)")
+        ax.axis("off")
+        plt.show()
+        return
+
+    uniq, cnt = np.unique(vals, return_counts=True)
+    order = np.argsort(cnt)[::-1]
+    uniq = uniq[order]
+    cnt = cnt[order]
+
+    h_u8 = ((uniq >> 16) & 0xFF).astype(np.uint8)
+    s_u8 = ((uniq >> 8) & 0xFF).astype(np.uint8)
+    v_u8 = (uniq & 0xFF).astype(np.uint8)
+
+    selected_pixels = int(vals.size)
+    excluded_pixels = int(np.count_nonzero(mask & excluded_box))
+    unique_n = int(uniq.size)
+    print(f"Selected pixels: {selected_pixels}")
+    print(f"Excluded by HSV box: {excluded_pixels}")
+    print(f"Unique exact HSV values: {unique_n}")
+    print("Top 20 exact HSV values by count:")
+    for i in range(min(20, unique_n)):
+        c = int(cnt[i])
+        h = int(h_u8[i])
+        s = int(s_u8[i])
+        v = int(v_u8[i])
+        print(f"  {i + 1:2d}. HSV=({h:3d},{s:3d},{v:3d}) count={c}")
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 7), constrained_layout=True)
+    ranks = np.arange(1, unique_n + 1, dtype=np.int64)
+    log_counts = np.log10(cnt.astype(np.float64))
+    ax.plot(ranks, log_counts, color="#1f77b4", linewidth=1.4)
+
+    # Draw colored points for the most frequent exact HSV values so the
+    # actual represented colors are visible directly on the rank plot.
+    max_scatter_points = 4000
+    show_n = min(unique_n, max_scatter_points)
+    hsv_top = np.column_stack(
+        [
+            h_u8[:show_n].astype(np.float32) / 255.0,
+            s_u8[:show_n].astype(np.float32) / 255.0,
+            v_u8[:show_n].astype(np.float32) / 255.0,
+        ]
+    )
+    rgb_top = hsv_to_rgb(hsv_top)
+    scat = ax.scatter(
+        ranks[:show_n],
+        log_counts[:show_n],
+        c=rgb_top,
+        s=18,
+        edgecolors="black",
+        linewidths=0.2,
+        alpha=0.95,
+        zorder=3,
+    )
+
+    ax.set_xscale("log")
+    ax.set_xlabel("HSV rank by frequency (log scale)")
+    ax.set_ylabel("log10(count)")
+    ax.set_title(
+        f"{title}\n"
+        f"selected_pixels={selected_pixels}, excluded={excluded_pixels}, unique_hsv={unique_n}, shown_colors={show_n}"
+    )
+    ax.grid(True, alpha=0.3)
+
+    annot = ax.annotate(
+        "",
+        xy=(0, 0),
+        xytext=(12, 12),
+        textcoords="offset points",
+        bbox={"boxstyle": "round", "fc": "black", "ec": "white", "alpha": 0.85},
+        color="white",
+        fontsize=8,
+        zorder=10,
+    )
+    annot.set_visible(False)
+
+    def _tooltip_text(i: int) -> str:
+        return (
+            f"rank={i + 1}\n"
+            f"HSV=({int(h_u8[i])},{int(s_u8[i])},{int(v_u8[i])})\n"
+            f"count={int(cnt[i])}, log10={float(log_counts[i]):.4f}"
+        )
+
+    def on_move(event):
+        if event.inaxes != ax:
+            if annot.get_visible():
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+            return
+        hit, info = scat.contains(event)
+        inds = info.get("ind")
+        if (not hit) or inds is None or len(inds) == 0:
+            if annot.get_visible():
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+            return
+
+        i = int(inds[0])
+        annot.xy = (float(ranks[i]), float(log_counts[i]))
+        annot.set_text(_tooltip_text(i))
+        if not annot.get_visible():
+            annot.set_visible(True)
+        fig.canvas.draw_idle()
+
+    def on_click(event):
+        if event.inaxes != ax or getattr(event, "button", None) != 1:
+            return
+        hit, info = scat.contains(event)
+        inds = info.get("ind")
+        if (not hit) or inds is None or len(inds) == 0:
+            return
+        i = int(inds[0])
+        print(
+            "Clicked exact HSV: "
+            f"rank={i + 1}, HSV=({int(h_u8[i])},{int(s_u8[i])},{int(v_u8[i])}), "
+            f"count={int(cnt[i])}, log10={float(log_counts[i]):.4f}"
+        )
+
+    fig.canvas.mpl_connect("motion_notify_event", on_move)
+    fig.canvas.mpl_connect("button_press_event", on_click)
+
+    # Also provide a compact top-N swatch panel with explicit HSV labels.
+    swatch_n = min(40, unique_n)
+    fig_sw, ax_sw = plt.subplots(1, 1, figsize=(12, 9), constrained_layout=True)
+    y = np.arange(swatch_n)
+    sw_hsv = np.column_stack(
+        [
+            h_u8[:swatch_n].astype(np.float32) / 255.0,
+            s_u8[:swatch_n].astype(np.float32) / 255.0,
+            v_u8[:swatch_n].astype(np.float32) / 255.0,
+        ]
+    )
+    sw_rgb = hsv_to_rgb(sw_hsv)
+    sw_log_counts = np.log10(cnt[:swatch_n].astype(np.float64))
+    ax_sw.barh(y, sw_log_counts, color=sw_rgb, edgecolor="black", linewidth=0.4)
+    xmax = float(np.max(sw_log_counts)) if swatch_n > 0 else 1.0
+    ax_sw.set_xlim(0.0, max(1.0, xmax * 1.05))
+    ax_sw.set_xlabel("log10(count)")
+    ax_sw.set_yticks(y)
+    ax_sw.set_yticklabels(
+        [
+            (
+                f"#{i + 1:02d}  HSV=({int(h_u8[i])},{int(s_u8[i])},{int(v_u8[i])})  "
+                f"count={int(cnt[i])}"
+            )
+            for i in range(swatch_n)
+        ],
+        fontsize=8,
+    )
+    ax_sw.invert_yaxis()
+    ax_sw.set_title(
+        f"Top {swatch_n} exact HSV values with colors "
+        f"(excluding H[219-242], S[100-180], V[88-250])"
+    )
+
+    plt.show()
 
 
 def top_exact_hsv_counts(
@@ -375,6 +590,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Count image pixels in fixed HSV bins and show an interactive summary.")
     parser.add_argument("image", help="Input image path")
     parser.add_argument(
+        "--spline-json",
+        default=None,
+        help=(
+            "Optional spline JSON path. When provided, counts exact HSV values only in the "
+            "region: outside outer spline OR inside inner spline, and plots log-counts."
+        ),
+    )
+    parser.add_argument(
         "--extreme-v-fraction",
         type=float,
         default=0.05,
@@ -387,6 +610,16 @@ def main() -> None:
 
     rgb = load_image_rgb(args.image)
     packed_hsv = packed_hsv_from_rgb(rgb)
+
+    if args.spline_json:
+        region_mask = _spline_region_mask(packed_hsv, args.spline_json)
+        plot_exact_hsv_counts_log(
+            packed_hsv=packed_hsv,
+            mask=region_mask,
+            title="Exact HSV counts (outside outer OR inside inner)",
+        )
+        return
+
     mask = np.ones(packed_hsv.shape, dtype=bool)
 
     plot_hsv_count_summary(
