@@ -22,6 +22,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.collections import LineCollection
 from matplotlib.colors import rgb_to_hsv
 from PIL import Image, ImageOps
 
@@ -273,7 +274,11 @@ def _nearest_point_on_closed_polyline(pt: np.ndarray, curve_closed: np.ndarray) 
     return best_pt, float(math.sqrt(best_d2))
 
 
-def _build_centerline_spline(outer: np.ndarray, inner: np.ndarray) -> np.ndarray | None:
+def _build_centerline_spline(
+    outer: np.ndarray,
+    inner: np.ndarray,
+    return_radii: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray] | None:
     if outer is None or inner is None:
         return None
     if outer.shape[0] < 3 or inner.shape[0] < 3:
@@ -286,13 +291,16 @@ def _build_centerline_spline(outer: np.ndarray, inner: np.ndarray) -> np.ndarray
     inner_open = inner_rs[:-1]
 
     center_pts: list[np.ndarray] = []
+    center_radii: list[float] = []
     for i_pt in inner_open:
         nearest_outer, dist = _nearest_point_on_closed_polyline(i_pt, outer_rs)
         if dist <= 1e-9:
             center_pts.append(i_pt.copy())
+            center_radii.append(0.0)
             continue
         direction = nearest_outer - i_pt
         center_pts.append(i_pt + 0.5 * direction)
+        center_radii.append(0.5 * float(dist))
 
     print(f"Centerline builder: midpoint samples from inner->outer nearest map={len(center_pts)}")
 
@@ -301,7 +309,14 @@ def _build_centerline_spline(outer: np.ndarray, inner: np.ndarray) -> np.ndarray
 
     center = np.asarray(center_pts, dtype=np.float32)
     center = _ensure_closed_curve(center)
-    return center.astype(np.float32)
+    center_out = center.astype(np.float32)
+    radii = np.asarray(center_radii, dtype=np.float32)
+    if radii.size > 0:
+        radii = np.concatenate([radii, radii[:1]])
+
+    if bool(return_radii):
+        return center_out, radii.astype(np.float32)
+    return center_out
 
 
 def _plot_trace_failure_debug(
@@ -1966,6 +1981,7 @@ def _run_image_only_hsv_mode(
     inner_control_xy: np.ndarray | None = None
     inner_spline_xy: np.ndarray | None = None
     centerline_xy: np.ndarray | None = None
+    centerline_radius: np.ndarray | None = None
     inner_start: tuple[int, int] | None = None
     inner_intersects_outer = False
     if seed_fg is not None:
@@ -2055,7 +2071,13 @@ def _run_image_only_hsv_mode(
                     inner_spline_xy = smooth_inner
 
             if outer_control_xy is not None and inner_control_xy is not None:
-                centerline_xy = _build_centerline_spline(outer_control_xy, inner_control_xy)
+                centerline_built = _build_centerline_spline(
+                    outer_control_xy,
+                    inner_control_xy,
+                    return_radii=True,
+                )
+                if centerline_built is not None:
+                    centerline_xy, centerline_radius = centerline_built
                 inner_intersects_outer = bool(_spline_intersects(outer_spline_xy, inner_spline_xy))
 
     print("Image-only HSV mode")
@@ -2215,6 +2237,76 @@ def _run_image_only_hsv_mode(
     else:
         plt.show()
 
+    # Dedicated centerline-variation view: color by local radius and chart radius vs point index.
+    if centerline_xy is not None and centerline_radius is not None:
+        center_pts = np.asarray(centerline_xy, dtype=np.float64)
+        center_rad = np.asarray(centerline_radius, dtype=np.float64)
+        if center_pts.shape[0] == center_rad.shape[0] and center_pts.shape[0] >= 3:
+            # Remove duplicated closure point for easier index-based plotting.
+            if float(np.hypot(*(center_pts[0] - center_pts[-1]))) <= 1e-6:
+                center_pts_open = center_pts[:-1]
+                center_rad_open = center_rad[:-1]
+            else:
+                center_pts_open = center_pts
+                center_rad_open = center_rad
+
+            if center_pts_open.shape[0] >= 2:
+                seg_start = center_pts_open
+                seg_end = np.roll(center_pts_open, -1, axis=0)
+                segments = np.stack([seg_start, seg_end], axis=1)
+                seg_radius = 0.5 * (center_rad_open + np.roll(center_rad_open, -1))
+
+                rmin = float(np.min(center_rad_open))
+                rmax = float(np.max(center_rad_open))
+                if abs(rmax - rmin) <= 1e-9:
+                    rmax = rmin + 1e-9
+
+                fig_var, (ax_curve, ax_rad) = plt.subplots(
+                    1,
+                    2,
+                    figsize=(12, 5),
+                    gridspec_kw={"width_ratios": [1.15, 1.0]},
+                )
+
+                ax_curve.imshow(rgb, interpolation="nearest")
+                lc = LineCollection(
+                    segments,
+                    cmap="viridis",
+                    linewidths=2.6,
+                    alpha=0.96,
+                )
+                lc.set_array(seg_radius)
+                lc.set_clim(rmin, rmax)
+                ax_curve.add_collection(lc)
+                ax_curve.scatter(
+                    center_pts_open[:, 0],
+                    center_pts_open[:, 1],
+                    c=center_rad_open,
+                    cmap="viridis",
+                    s=14,
+                    edgecolors="none",
+                    alpha=0.95,
+                )
+                cbar = fig_var.colorbar(lc, ax=ax_curve, fraction=0.046, pad=0.03)
+                cbar.set_label("Centerline radius (px)")
+                ax_curve.set_title("Centerline colored by local radius")
+                ax_curve.set_xticks([])
+                ax_curve.set_yticks([])
+
+                idx = np.arange(center_rad_open.shape[0], dtype=np.int32)
+                ax_rad.plot(idx, center_rad_open, color="#1558d6", linewidth=1.5)
+                ax_rad.scatter(idx, center_rad_open, c=center_rad_open, cmap="viridis", s=18)
+                ax_rad.set_title("Centerline radius vs point index")
+                ax_rad.set_xlabel("Centerline point index")
+                ax_rad.set_ylabel("Radius (px)")
+                ax_rad.grid(alpha=0.3, linewidth=0.6)
+
+                fig_var.tight_layout()
+                if is_noninteractive:
+                    plt.close(fig_var)
+                else:
+                    plt.show()
+
     output = {
         "version": 1,
         "mode": "image_only_hsv",
@@ -2252,6 +2344,11 @@ def _run_image_only_hsv_mode(
         "centerline_spline": (
             [[float(p[0]), float(p[1])] for p in np.asarray(centerline_xy, dtype=np.float64)]
             if centerline_xy is not None
+            else None
+        ),
+        "centerline_radius": (
+            [float(r) for r in np.asarray(centerline_radius, dtype=np.float64)]
+            if centerline_radius is not None
             else None
         ),
         "inner_intersects_outer": bool(inner_intersects_outer),
@@ -2443,6 +2540,7 @@ def main() -> None:
         "outer_spline": spline_data.get("outer"),
         "inner_spline": spline_data.get("inner"),
         "centerline_spline": spline_data.get("centerline"),
+        "centerline_radius": spline_data.get("centerline_radius"),
         "inner_intersects_outer": bool(spline_data.get("intersects", False)),
     }
     spline_out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
@@ -2528,6 +2626,7 @@ def _show_map(
     traced_outer = None
     traced_inner = None
     centerline = None
+    centerline_radius = None
     intersects = False
 
     if metric == "hp_removed":
@@ -2600,7 +2699,13 @@ def _show_map(
                     print(f"Inner spline points: {traced_inner.shape[0]}")
                     for ax in (ax_src, ax_map):
                         ax.plot(traced_inner[:, 0], traced_inner[:, 1], color="cyan", linewidth=1.8, alpha=0.95)
-                    centerline = _build_centerline_spline(traced_outer, traced_inner)
+                    centerline_built = _build_centerline_spline(
+                        traced_outer,
+                        traced_inner,
+                        return_radii=True,
+                    )
+                    if centerline_built is not None:
+                        centerline, centerline_radius = centerline_built
                     if centerline is not None:
                         print(
                             "Centerline spline: built midpoint curve from outer/inner splines; "
@@ -2710,6 +2815,11 @@ def _show_map(
         "outer": _curve_to_json(traced_outer),
         "inner": _curve_to_json(traced_inner),
         "centerline": _curve_to_json(centerline),
+        "centerline_radius": (
+            [float(r) for r in np.asarray(centerline_radius, dtype=np.float64)]
+            if centerline_radius is not None
+            else None
+        ),
         "intersects": bool(intersects),
     }
 
