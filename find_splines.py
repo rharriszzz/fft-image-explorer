@@ -14,6 +14,7 @@ JSON, and displays the original image + map with splines overlaid on both.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import time
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import rgb_to_hsv
 from PIL import Image, ImageOps
 
 
@@ -298,7 +300,6 @@ def _build_centerline_spline(outer: np.ndarray, inner: np.ndarray) -> np.ndarray
         return None
 
     center = np.asarray(center_pts, dtype=np.float32)
-    center = _smooth_closed_curve(center, window=9, passes=2)
     center = _ensure_closed_curve(center)
     return center.astype(np.float32)
 
@@ -317,6 +318,7 @@ def _plot_trace_failure_debug(
     spline_point_index: int,
     spline_label: str,
     is_transition_fn,
+    wait_for_close: bool = False,
 ) -> None:
     """Plot a legible diagnostic view for the current failure point and ring candidates."""
     h, w = raw_map.shape
@@ -324,7 +326,7 @@ def _plot_trace_failure_debug(
     py = int(ys[curr_y])
     radius_px = int(ring_steps * step)
 
-    fig, (ax_full, ax_zoom) = plt.subplots(1, 2, figsize=(13, 6), constrained_layout=True)
+    fig, (ax_full, ax_zoom, ax_ring) = plt.subplots(1, 3, figsize=(17, 6))
 
     im0 = ax_full.imshow(raw_map, cmap="magma", vmin=0, vmax=100, interpolation="nearest")
     ax_full.set_title("Failure point context")
@@ -338,7 +340,12 @@ def _plot_trace_failure_debug(
     ax_zoom.set_title("Failure-point ring candidates")
     ax_zoom.scatter([px], [py], s=80, c="cyan", edgecolors="black", linewidths=0.9, zorder=6)
 
-    for dy, dx in ring_offsets:
+    ring_vals: list[float] = []
+    ring_trans: list[bool] = []
+    ring_states_hi: list[bool] = []
+    ring_angles_deg: list[float] = []
+
+    for idx, (dy, dx) in enumerate(ring_offsets):
         ny = curr_y + dy
         nx = curr_x + dx
         if ny < 1 or nx < 1 or ny >= coarse.shape[0] - 1 or nx >= coarse.shape[1] - 1:
@@ -351,29 +358,64 @@ def _plot_trace_failure_debug(
         color = "lime" if hi else "red"
         marker = "o" if trans else "x"
         ax_zoom.scatter([npx], [npy], s=50, c=color, marker=marker, linewidths=1.0, zorder=5)
-        ax_zoom.text(
-            npx + 2,
-            npy + 2,
-            f"{val:.1f}",
-            color="white",
-            fontsize=7,
-            ha="left",
-            va="bottom",
-            bbox={"facecolor": "black", "alpha": 0.45, "pad": 0.2, "edgecolor": "none"},
-            zorder=6,
-        )
+        ring_vals.append(val)
+        ring_trans.append(trans)
+        ring_states_hi.append(bool(hi))
+        ring_angles_deg.append(float(idx) * 360.0 / float(max(1, len(ring_offsets))))
 
     ax_zoom.set_xlim(max(0, px - 2 * radius_px), min(w - 1, px + 2 * radius_px))
     ax_zoom.set_ylim(min(h - 1, py + 2 * radius_px), max(0, py - 2 * radius_px))
+
+    if ring_vals:
+        idxs = np.arange(len(ring_vals), dtype=np.int32)
+        vals = np.asarray(ring_vals, dtype=np.float32)
+        ring_hi_arr = np.asarray(ring_states_hi, dtype=bool)
+        trans_arr = np.asarray(ring_trans, dtype=bool)
+        ax_ring.plot(idxs, vals, color="white", linewidth=1.2, alpha=0.9)
+        ax_ring.scatter(idxs[ring_hi_arr], vals[ring_hi_arr], s=22, c="lime", label="HIGH")
+        ax_ring.scatter(idxs[~ring_hi_arr], vals[~ring_hi_arr], s=22, c="red", label="LOW")
+        if np.any(trans_arr):
+            ax_ring.scatter(
+                idxs[trans_arr],
+                vals[trans_arr],
+                s=70,
+                facecolors="none",
+                edgecolors="cyan",
+                linewidths=1.2,
+                label="transition",
+            )
+        ax_ring.axhline(float(threshold), color="yellow", linestyle="--", linewidth=1.0, label="threshold")
+        ax_ring.set_xlabel("ring sample index")
+        ax_ring.set_ylabel("raw value")
+        ax_ring.set_title("Ring values around failure point")
+        ax_ring.legend(loc="best", fontsize=7)
+        if ring_angles_deg:
+            tick_idx = np.linspace(0, len(ring_angles_deg) - 1, num=min(8, len(ring_angles_deg)), dtype=int)
+            ax_ring.set_xticks(tick_idx)
+            ax_ring.set_xticklabels([f"{ring_angles_deg[i]:.0f}deg" for i in tick_idx], rotation=25)
+    else:
+        ax_ring.set_title("Ring values: unavailable")
+        ax_ring.text(0.5, 0.5, "No in-bounds ring samples", ha="center", va="center", transform=ax_ring.transAxes)
 
     fig.colorbar(im0, ax=[ax_full, ax_zoom], fraction=0.03, pad=0.02, label="Raw value")
     fig.suptitle(
         f"Tracer debug at {spline_label} spline point {spline_point_index}\n"
         f"{spline_label} spline point=(y={py}, x={px}), threshold={threshold:.1f}, ring={ring_steps} steps ({radius_px} px)"
     )
-    # Render this diagnostic window without blocking; final blocking show occurs in _show_map.
-    plt.show(block=False)
-    plt.pause(0.001)
+    backend = str(plt.get_backend()).lower()
+    noninteractive_backends = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+    is_noninteractive = backend in noninteractive_backends or backend.startswith("module://matplotlib_inline")
+    if is_noninteractive:
+        plt.close(fig)
+        return
+    # Use tight_layout instead of constrained_layout to avoid backend warnings
+    # about collapsed axes in some interactive Tk sessions.
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    if wait_for_close:
+        plt.show(block=True)
+    else:
+        plt.show(block=False)
+        plt.pause(0.001)
 
 
 def _build_step_grid(
@@ -506,15 +548,54 @@ def _collect_ring_transitions(
         if not changed:
             break
 
+    # Ignore short HIGH islands when they are bracketed by long LOW runs.
+    # Rule requested by user: if HIGH run <= 4 and both neighboring LOW runs
+    # are > 10, convert that HIGH run to LOW.
+    for _ in range(max(1, n)):
+        changed = False
+        runs = _circular_runs(np.asarray(cleaned_states, dtype=bool))
+        if not runs:
+            break
+        m = len(runs)
+        for i, (state, start, run_len) in enumerate(runs):
+            if not bool(state):
+                continue
+            left_state, _left_start, left_len = runs[(i - 1) % m]
+            right_state, _right_start, right_len = runs[(i + 1) % m]
+            if bool(left_state) or bool(right_state):
+                continue
+            if int(run_len) <= 4 and int(left_len) > 10 and int(right_len) > 10:
+                print(
+                    "Warning: removed short HIGH island "
+                    f"len={int(run_len)} between LOW runs len={int(left_len)} and len={int(right_len)}"
+                )
+                for k in range(int(run_len)):
+                    cleaned_states[(int(start) + k) % n] = False
+                changed = True
+        if not changed:
+            break
+
     for i, row in enumerate(in_bounds):
         prev_state = cleaned_states[(i - 1) % n]
         curr_state = cleaned_states[i]
         if curr_state != prev_state:
             row_out = dict(row)
+            row_out["ring_idx"] = i
             row_out["prev_state"] = prev_state
             row_out["curr_state"] = curr_state
             row_out["transition_type"] = "LOW->HIGH" if (not prev_state and curr_state) else "HIGH->LOW"
             trans.append(row_out)
+
+    if trans:
+        transition_positions = [int(t["ring_idx"]) for t in trans]
+        m = len(transition_positions)
+        for k, t in enumerate(trans):
+            i = transition_positions[k]
+            prev_i = transition_positions[(k - 1) % m]
+            run_len = (i - prev_i) % n
+            if run_len == 0:
+                run_len = n
+            t["run_len_prev"] = int(run_len)
     return trans
 
 
@@ -526,6 +607,7 @@ def _find_inner_start_from_outer_point0(
     ys: np.ndarray,
     xs: np.ndarray,
     coarse: np.ndarray,
+    start_radius: int = 64,
 ) -> tuple[int, int] | None:
     oy, ox = outer_start
     print("Inner-start search: begin from outer spline point 0")
@@ -534,7 +616,7 @@ def _find_inner_start_from_outer_point0(
         f"raw={float(coarse[oy, ox]):.3f}, threshold={threshold:.3f}"
     )
 
-    baseline_r = 4
+    baseline_r = max(1, int(start_radius))
     base_trans = _collect_ring_transitions(coarse, threshold, oy, ox, baseline_r)
     print(f"  radius={baseline_r}: transitions={len(base_trans)}")
     for i, t in enumerate(base_trans):
@@ -544,22 +626,28 @@ def _find_inner_start_from_outer_point0(
             f"raw={float(t['raw']):.3f}"
         )
 
-    if len(base_trans) < 2:
-        print("  inner-start search stop: baseline ring does not contain 2 transitions.")
-        return None
-
-    max_r = min(max(coarse.shape) // 2, 60)
+    max_r = max(baseline_r, max(coarse.shape) // 2)
     for radius in range(baseline_r + 1, max_r + 1):
         trans = _collect_ring_transitions(coarse, threshold, oy, ox, radius)
         print(f"  radius={radius}: transitions={len(trans)}")
         for i, t in enumerate(trans):
+            run_len = int(t.get("run_len_prev", 0))
+            prev_state_txt = "HIGH" if bool(t.get("prev_state", False)) else "LOW"
             print(
                 f"    trans[{i}] angle={math.degrees(float(t['angle'])):.2f}deg "
                 f"{str(t['transition_type'])} grid(y={int(t['ny'])},x={int(t['nx'])}) "
-                f"raw={float(t['raw']):.3f}"
+                f"raw={float(t['raw']):.3f} after {run_len} consecutive {prev_state_txt} samples"
             )
 
+        # Keep center fixed at outer spline point 0 and expand until we have
+        # enough transition structure to isolate the inner pair.
         if len(trans) < 4:
+            continue
+
+        if len(base_trans) < 2:
+            print(
+                "    baseline has fewer than 2 transitions; cannot identify which transitions belong to outer boundary."
+            )
             continue
 
         base_angles = [float(t["angle"]) for t in base_trans]
@@ -575,6 +663,7 @@ def _find_inner_start_from_outer_point0(
             scored.append((dmin, i))
 
         scored.sort(key=lambda x: x[0])
+        # Two transitions near baseline correspond to outer boundary crossings.
         keep_existing = {idx for _, idx in scored[:2]}
         new_idxs = [i for i in range(len(trans)) if i not in keep_existing]
         if len(new_idxs) < 2:
@@ -583,25 +672,59 @@ def _find_inner_start_from_outer_point0(
 
         t1 = trans[new_idxs[0]]
         t2 = trans[new_idxs[1]]
+
+        run1 = int(t1.get("run_len_prev", 0))
+        run2 = int(t2.get("run_len_prev", 0))
+        if run1 < 12 or run2 < 12:
+            print(
+                "    rejected new transitions: minimum consecutive run length not met "
+                f"(new[1]={run1}, new[2]={run2}, required>=12); continue."
+            )
+            continue
+
         print("    identified new transitions:")
         for j, t in enumerate([t1, t2], start=1):
+            run_len = int(t.get("run_len_prev", 0))
+            prev_state_txt = "HIGH" if bool(t.get("prev_state", False)) else "LOW"
             print(
                 f"      new[{j}] angle={math.degrees(float(t['angle'])):.2f}deg "
                 f"{str(t['transition_type'])} grid(y={int(t['ny'])},x={int(t['nx'])}) "
-                f"pixel(y={int(ys[int(t['ny'])])},x={int(xs[int(t['nx'])])})"
+                f"pixel(y={int(ys[int(t['ny'])])},x={int(xs[int(t['nx'])])}) "
+                f"after {run_len} consecutive {prev_state_txt} samples"
             )
 
         mid_y = int(round((int(t1["ny"]) + int(t2["ny"])) / 2.0))
         mid_x = int(round((int(t1["nx"]) + int(t2["nx"])) / 2.0))
         mid_y = int(np.clip(mid_y, 1, coarse.shape[0] - 2))
         mid_x = int(np.clip(mid_x, 1, coarse.shape[1] - 2))
+
+        # Prefer a foreground-valued start point so the inner tracer begins on
+        # the bracelet side of the boundary when possible.
+        if float(coarse[mid_y, mid_x]) < threshold:
+            fg_candidate: tuple[int, int] | None = None
+            for t in (t1, t2):
+                if str(t["transition_type"]) == "LOW->HIGH":
+                    ty = int(np.clip(int(t["ny"]), 1, coarse.shape[0] - 2))
+                    tx = int(np.clip(int(t["nx"]), 1, coarse.shape[1] - 2))
+                    if float(coarse[ty, tx]) >= threshold:
+                        fg_candidate = (ty, tx)
+                        break
+            if fg_candidate is not None:
+                mid_y, mid_x = fg_candidate
+            else:
+                for t in (t1, t2):
+                    ty = int(np.clip(int(t["ny"]), 1, coarse.shape[0] - 2))
+                    tx = int(np.clip(int(t["nx"]), 1, coarse.shape[1] - 2))
+                    if float(coarse[ty, tx]) >= threshold:
+                        mid_y, mid_x = ty, tx
+                        break
         print(
             f"    inner spline point 0 midpoint grid(y={mid_y},x={mid_x}) "
             f"pixel(y={int(ys[mid_y])},x={int(xs[mid_x])}) raw={float(coarse[mid_y, mid_x]):.3f}"
         )
         return mid_y, mid_x
 
-    print("  inner-start search stop: no radius produced >=4 transitions.")
+    print("  inner-start search stop: no expanded radius produced at least 4 transitions.")
     return None
 
 
@@ -610,11 +733,14 @@ def _trace_outer_spline_step_cells(
     step: int,
     threshold: float = 99.0,
     ring_steps: int = 4,
+    max_bg_gap: int = 0,
     clockwise: bool = True,
     debug_start_point: int | None = None,
     start_point: tuple[int, int] | None = None,
     spline_label: str = "outer",
     return_partial_on_stop: bool = False,
+    verbose: bool = True,
+    smooth_output: bool = True,
 ) -> np.ndarray | None:
     """Trace an outer bracelet spline by stepping along threshold transitions on the step grid."""
     h, w = raw_map.shape
@@ -632,12 +758,13 @@ def _trace_outer_spline_step_cells(
             )
             return None
         start = (int(sy), int(sx))
-        print(
-            f"Tracer start ({spline_label} spline): using provided {spline_label} spline point "
-            f"grid(y={start[0]},x={start[1]}) "
-            f"pixel(y={int(ys[start[0]])},x={int(xs[start[1]])}) "
-            f"raw={float(coarse[start[0], start[1]]):.3f}"
-        )
+        if verbose:
+            print(
+                f"Tracer start ({spline_label} spline): using provided {spline_label} spline point "
+                f"grid(y={start[0]},x={start[1]}) "
+                f"pixel(y={int(ys[start[0]])},x={int(xs[start[1]])}) "
+                f"raw={float(coarse[start[0], start[1]]):.3f}"
+            )
     else:
         # Start from one end of the centerline and move inward until value drops below threshold.
         start, _ = _find_centerline_start(coarse=coarse, hi=hi, ys=ys, xs=xs)
@@ -673,10 +800,11 @@ def _trace_outer_spline_step_cells(
     pts: list[tuple[int, int]] = [(curr_y, curr_x)]
     visited_at: dict[tuple[int, int], int] = {(curr_y, curr_x): 0}
     start_y, start_x = curr_y, curr_x
-    print(
-        f"{spline_label.capitalize()} spline point 0: grid(y={curr_y},x={curr_x}) "
-        f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])})"
-    )
+    if verbose:
+        print(
+            f"{spline_label.capitalize()} spline point 0: grid(y={curr_y},x={curr_x}) "
+            f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])})"
+        )
     prev_dir: tuple[float, float] | None = None
     max_turn_rad = math.radians(90.0)
     stop_reason: str | None = None
@@ -839,7 +967,7 @@ def _trace_outer_spline_step_cells(
                 curr_s = cleaned_ring_states[i]
                 next_s = cleaned_ring_states[(i + 1) % ring_n]
                 if prev_s == next_s and curr_s != prev_s:
-                    if i not in warned_isolated:
+                    if i not in warned_isolated and verbose:
                         prev_meta = ordered_ring_meta[(i - 1) % ring_n]
                         curr_meta = ordered_ring_meta[i]
                         next_meta = ordered_ring_meta[(i + 1) % ring_n]
@@ -855,11 +983,98 @@ def _trace_outer_spline_step_cells(
             if not changed:
                 break
 
+        # Ignore short HIGH islands bracketed by long LOW runs.
+        # This mirrors the inner-start ring cleanup rule.
+        for _ in range(max(1, ring_n)):
+            changed = False
+            runs = _circular_runs(np.asarray(cleaned_ring_states, dtype=bool))
+            if not runs:
+                break
+            m = len(runs)
+            for i, (state, start, run_len) in enumerate(runs):
+                if not bool(state):
+                    continue
+                left_state, _left_start, left_len = runs[(i - 1) % m]
+                right_state, _right_start, right_len = runs[(i + 1) % m]
+                if bool(left_state) or bool(right_state):
+                    continue
+                if int(run_len) <= 4 and int(left_len) > 10 and int(right_len) > 10:
+                    if verbose:
+                        print(
+                            "Warning: removed short HIGH island in tracer "
+                            f"at {spline_label} spline point {len(pts) - 1}; "
+                            f"len={int(run_len)} between LOW runs len={int(left_len)} and len={int(right_len)}"
+                        )
+                    for k in range(int(run_len)):
+                        cleaned_ring_states[(int(start) + k) % ring_n] = False
+                    changed = True
+            if not changed:
+                break
+
+        # Optionally bridge short LOW runs enclosed by HIGH runs.
+        # In this tracer, HIGH corresponds to bracelet/foreground and LOW to background.
+        # Bridging a short LOW run should remove two transitions.
+        if int(max_bg_gap) > 0:
+            before_bridge = np.asarray(cleaned_ring_states, dtype=bool)
+            # Pass 1: merge short LOW gaps into HIGH.
+            cleaned_ring_states = _bridge_small_background_gaps(
+                before_bridge,
+                max_bg_gap=int(max_bg_gap),
+            )
+            # Pass 2 (temporarily disabled): merge short HIGH islands into LOW.
+            enable_high_island_merge = False
+            if enable_high_island_merge:
+                cleaned_ring_states = np.logical_not(
+                    _bridge_small_background_gaps(
+                        np.logical_not(np.asarray(cleaned_ring_states, dtype=bool)),
+                        max_bg_gap=int(max_bg_gap),
+                    )
+                )
+            if verbose and not np.array_equal(before_bridge, cleaned_ring_states):
+                b_lh = 0
+                b_hl = 0
+                a_lh = 0
+                a_hl = 0
+                for i in range(ring_n):
+                    b0 = before_bridge[i]
+                    b1 = before_bridge[(i + 1) % ring_n]
+                    if (not b0) and b1:
+                        b_lh += 1
+                    elif b0 and (not b1):
+                        b_hl += 1
+                    a0 = cleaned_ring_states[i]
+                    a1 = cleaned_ring_states[(i + 1) % ring_n]
+                    if (not a0) and a1:
+                        a_lh += 1
+                    elif a0 and (not a1):
+                        a_hl += 1
+                print(
+                    f"Ring gap-bridge ({spline_label} spline point {len(pts) - 1}): "
+                    f"LOW->HIGH {b_lh}->{a_lh}, HIGH->LOW {b_hl}->{a_hl}, max_bg_gap={int(max_bg_gap)}"
+                )
+
         for i, row in enumerate(in_bounds_entries):
             prev_state = cleaned_ring_states[(i - 1) % ring_n]
             curr_state = cleaned_ring_states[i]
             trans = bool(curr_state != prev_state)
             row["transition"] = trans
+
+        ring_runs = _circular_runs(np.asarray(cleaned_ring_states, dtype=bool))
+        transition_positions = sorted({int(start) for _state, start, _len in ring_runs})
+        if transition_positions:
+            m = len(transition_positions)
+            for k, i in enumerate(transition_positions):
+                prev_i = transition_positions[(k - 1) % m]
+                run_len = (i - prev_i) % ring_n
+                if run_len == 0:
+                    run_len = ring_n
+                prev_state = bool(cleaned_ring_states[(i - 1) % ring_n])
+                curr_state = bool(cleaned_ring_states[i])
+                trans_type = "LOW->HIGH" if ((not prev_state) and curr_state) else "HIGH->LOW"
+                print(
+                    f"Transition scan ({spline_label} spline point {len(pts) - 1}): {trans_type} at ring[{i:02d}] "
+                    f"after {run_len} consecutive {'HIGH' if prev_state else 'LOW'} samples."
+                )
 
         for row in in_bounds_entries:
             ord_idx = int(row["ord_idx"])
@@ -940,12 +1155,12 @@ def _trace_outer_spline_step_cells(
 
         low_to_high = 0
         high_to_low = 0
-        for i in range(ring_n):
-            a = cleaned_ring_states[i]
-            b = cleaned_ring_states[(i + 1) % ring_n]
-            if (not a) and b:
+        for i in transition_positions:
+            prev_state = bool(cleaned_ring_states[(i - 1) % ring_n])
+            curr_state = bool(cleaned_ring_states[i])
+            if (not prev_state) and curr_state:
                 low_to_high += 1
-            elif a and (not b):
+            elif prev_state and (not curr_state):
                 high_to_low += 1
 
         if low_to_high != 1 or high_to_low != 1:
@@ -971,6 +1186,8 @@ def _trace_outer_spline_step_cells(
                 f"{median_msg}."
             )
             for ord_idx, sweep_angle, dy, dx, ny, nx, val in ordered_ring_meta:
+                if not verbose:
+                    break
                 state_txt = "HIGH" if val >= threshold else "LOW"
                 print(
                     f"  ring[{ord_idx:02d}] {sweep_label} {math.degrees(sweep_angle):6.2f}deg "
@@ -978,7 +1195,7 @@ def _trace_outer_spline_step_cells(
                     f"pixel(y={int(ys[ny])},x={int(xs[nx])}) raw={val:.3f} state={state_txt}"
                 )
 
-            # Show a visual diagnostic snapshot at the mismatch point.
+            # Always show ring diagnostic plot at mismatch so the user can inspect failure.
             _plot_trace_failure_debug(
                 raw_map=raw_map,
                 coarse=coarse,
@@ -993,9 +1210,10 @@ def _trace_outer_spline_step_cells(
                 spline_point_index=len(pts) - 1,
                 spline_label=spline_label,
                 is_transition_fn=is_transition,
+                wait_for_close=True,
             )
 
-            if len(pts) >= 2:
+            if verbose and len(pts) >= 2:
                 prev_y, prev_x = pts[-2]
                 _plot_trace_failure_debug(
                     raw_map=raw_map,
@@ -1011,6 +1229,7 @@ def _trace_outer_spline_step_cells(
                     spline_point_index=len(pts) - 2,
                     spline_label=spline_label,
                     is_transition_fn=is_transition,
+                    wait_for_close=False,
                 )
             if return_partial_on_stop:
                 return _partial_trace_pixels()
@@ -1022,74 +1241,90 @@ def _trace_outer_spline_step_cells(
             )
             cand_in_bounds = cand_total - cand_oob
             cand_transition = cand_in_bounds - cand_not_transition
-            print(
-                f"Tracer debug(no_candidate, {spline_label} spline): "
-                f"grid(y={curr_y},x={curr_x}) pixel(y={curr_py},x={curr_px}) "
-                f"raw={float(coarse[curr_y, curr_x]):.3f} threshold={threshold:.3f}"
-            )
-            print(
-                "  candidate counts: "
-                f"total={cand_total}, out_of_bounds={cand_oob}, in_bounds={cand_in_bounds}, "
-                f"transition={cand_transition}, non_transition={cand_not_transition}, "
-                f"too_short={cand_too_short}, turn_reject={cand_turn_reject}, "
-                f"scored={cand_scored}"
-            )
-            if prev_dir is not None:
+            if verbose:
                 print(
-                    "  local-turn config: "
-                    f"max_turn_deg={math.degrees(max_turn_rad):.2f}, "
-                    f"prev_dir=({prev_dir[0]:.3f},{prev_dir[1]:.3f})"
+                    f"Tracer debug(no_candidate, {spline_label} spline): "
+                    f"grid(y={curr_y},x={curr_x}) pixel(y={curr_py},x={curr_px}) "
+                    f"raw={float(coarse[curr_y, curr_x]):.3f} threshold={threshold:.3f}"
                 )
-            print("  checked ring candidates (in sweep order):")
-            for row in cand_debug_rows:
-                ord_idx = int(row["ord_idx"])
-                sweep_angle = float(row["sweep_angle"])
-                dy = int(row["dy"])
-                dx = int(row["dx"])
-                status = str(row.get("status", "unknown"))
-                if status == "out_of_bounds":
+                print(
+                    "  candidate counts: "
+                    f"total={cand_total}, out_of_bounds={cand_oob}, in_bounds={cand_in_bounds}, "
+                    f"transition={cand_transition}, non_transition={cand_not_transition}, "
+                    f"too_short={cand_too_short}, turn_reject={cand_turn_reject}, "
+                    f"scored={cand_scored}"
+                )
+                if prev_dir is not None:
                     print(
+                        "  local-turn config: "
+                        f"max_turn_deg={math.degrees(max_turn_rad):.2f}, "
+                        f"prev_dir=({prev_dir[0]:.3f},{prev_dir[1]:.3f})"
+                    )
+                print("  checked ring candidates (in sweep order):")
+                for row in cand_debug_rows:
+                    ord_idx = int(row["ord_idx"])
+                    sweep_angle = float(row["sweep_angle"])
+                    dy = int(row["dy"])
+                    dx = int(row["dx"])
+                    status = str(row.get("status", "unknown"))
+                    if status == "out_of_bounds":
+                        print(
+                            f"    ring[{ord_idx:02d}] {sweep_label} {math.degrees(sweep_angle):6.2f}deg "
+                            f"(dy={dy:+d},dx={dx:+d}) -> out_of_bounds"
+                        )
+                        continue
+
+                    ny = int(row["ny"])
+                    nx = int(row["nx"])
+                    py = int(row["pixel_y"])
+                    px = int(row["pixel_x"])
+                    raw_val = float(row["raw"])
+                    state = str(row["state"])
+                    trans = bool(row["transition"])
+                    base = (
                         f"    ring[{ord_idx:02d}] {sweep_label} {math.degrees(sweep_angle):6.2f}deg "
-                        f"(dy={dy:+d},dx={dx:+d}) -> out_of_bounds"
+                        f"(dy={dy:+d},dx={dx:+d}) grid(y={ny},x={nx}) pixel(y={py},x={px}) "
+                        f"raw={raw_val:.3f} state={state} transition={'Y' if trans else 'N'}"
                     )
-                    continue
 
-                ny = int(row["ny"])
-                nx = int(row["nx"])
-                py = int(row["pixel_y"])
-                px = int(row["pixel_x"])
-                raw_val = float(row["raw"])
-                state = str(row["state"])
-                trans = bool(row["transition"])
-                base = (
-                    f"    ring[{ord_idx:02d}] {sweep_label} {math.degrees(sweep_angle):6.2f}deg "
-                    f"(dy={dy:+d},dx={dx:+d}) grid(y={ny},x={nx}) pixel(y={py},x={px}) "
-                    f"raw={raw_val:.3f} state={state} transition={'Y' if trans else 'N'}"
-                )
-
-                if status == "reject_non_transition":
-                    print(base + " -> reject_non_transition")
-                elif status == "reject_too_short":
-                    print(base + f" -> reject_too_short move={float(row['move']):.3f}")
-                elif status == "reject_turn":
-                    print(
-                        base
-                        + " -> reject_turn "
-                        + f"turn_deg={float(row['turn_deg']):.2f} > limit={float(row['turn_limit_deg']):.2f}"
-                    )
-                else:
-                    print(
-                        base
-                        + " -> accepted_scored "
-                        + f"turn_deg={float(row['turn_deg']):.2f}, "
-                        + f"cross={float(row['cross']):.3f}, "
-                        + f"wrong_turn={bool(row['wrong_turn'])}, "
-                        + f"score={float(row['score']):.4f}"
-                    )
+                    if status == "reject_non_transition":
+                        print(base + " -> reject_non_transition")
+                    elif status == "reject_too_short":
+                        print(base + f" -> reject_too_short move={float(row['move']):.3f}")
+                    elif status == "reject_turn":
+                        print(
+                            base
+                            + " -> reject_turn "
+                            + f"turn_deg={float(row['turn_deg']):.2f} > limit={float(row['turn_limit_deg']):.2f}"
+                        )
+                    else:
+                        print(
+                            base
+                            + " -> accepted_scored "
+                            + f"turn_deg={float(row['turn_deg']):.2f}, "
+                            + f"cross={float(row['cross']):.3f}, "
+                            + f"wrong_turn={bool(row['wrong_turn'])}, "
+                            + f"score={float(row['score']):.4f}"
+                        )
             stop_reason = "no_candidate"
             break
 
         next_y, next_x = best
+        expected_step_px = float(ring_steps * step)
+        actual_step_px = float(
+            math.hypot(
+                float(ys[next_y]) - float(ys[curr_y]),
+                float(xs[next_x]) - float(xs[curr_x]),
+            )
+        )
+        if not math.isclose(actual_step_px, expected_step_px, rel_tol=0.0, abs_tol=0.75):
+            raise RuntimeError(
+                "Tracer bug: consecutive spline points are not ring-radius apart; "
+                f"expected={expected_step_px:.6f}px, actual={actual_step_px:.6f}px, "
+                f"from grid(y={curr_y},x={curr_x}) to grid(y={next_y},x={next_x}), "
+                f"spline_point_index={len(pts)} ({spline_label} spline)."
+            )
+
         step_dx = float(next_x - curr_x)
         step_dy = float(next_y - curr_y)
         step_norm = math.hypot(step_dx, step_dy)
@@ -1097,11 +1332,12 @@ def _trace_outer_spline_step_cells(
             prev_dir = (step_dx / step_norm, step_dy / step_norm)
         curr_y, curr_x = next_y, next_x
         pts.append((curr_y, curr_x))
-        print(
-            f"{spline_label.capitalize()} spline point {len(pts) - 1}: grid(y={curr_y},x={curr_x}) "
-            f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])})"
-        )
-        if len(pts) >= 3:
+        if verbose:
+            print(
+                f"{spline_label.capitalize()} spline point {len(pts) - 1}: grid(y={curr_y},x={curr_x}) "
+                f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])})"
+            )
+        if len(pts) >= 3 and verbose:
             y0, x0 = pts[-3]
             y1, x1 = pts[-2]
             y2, x2 = pts[-1]
@@ -1122,7 +1358,7 @@ def _trace_outer_spline_step_cells(
                 print(
                     f"  turn angle at {spline_label} spline point {len(pts) - 1}: unavailable (zero-length segment)"
                 )
-        else:
+        elif verbose:
             print(
                 f"  turn angle at {spline_label} spline point {len(pts) - 1}: unavailable (need >= 3 points)"
             )
@@ -1141,11 +1377,12 @@ def _trace_outer_spline_step_cells(
                 f"revisited grid(y={curr_y},x={curr_x}) at {spline_label} spline point {len(pts) - 1}, "
                 f"first seen at {spline_label} spline point {first_idx}."
             )
-            print(
-                f"Tracer debug(cycle, {spline_label} spline): "
-                f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])}), "
-                f"raw={float(coarse[curr_y, curr_x]):.3f}, threshold={threshold:.3f}"
-            )
+            if verbose:
+                print(
+                    f"Tracer debug(cycle, {spline_label} spline): "
+                    f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])}), "
+                    f"raw={float(coarse[curr_y, curr_x]):.3f}, threshold={threshold:.3f}"
+                )
             stop_reason = "cycle_loop"
             break
 
@@ -1156,11 +1393,12 @@ def _trace_outer_spline_step_cells(
                 f"current grid(y={curr_y},x={curr_x}) at {spline_label} spline point {len(pts) - 1} "
                 f"is within 1.6 steps of {spline_label} spline point {near_idx}."
             )
-            print(
-                f"Tracer debug(near-cycle, {spline_label} spline): "
-                f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])}), "
-                f"raw={float(coarse[curr_y, curr_x]):.3f}, threshold={threshold:.3f}"
-            )
+            if verbose:
+                print(
+                    f"Tracer debug(near-cycle, {spline_label} spline): "
+                    f"pixel(y={int(ys[curr_y])},x={int(xs[curr_x])}), "
+                    f"raw={float(coarse[curr_y, curr_x]):.3f}, threshold={threshold:.3f}"
+                )
             stop_reason = "near_cycle_loop"
             break
         visited_at[key] = len(pts) - 1
@@ -1179,7 +1417,8 @@ def _trace_outer_spline_step_cells(
     pix = np.array([[float(xs[ix]), float(ys[iy])] for iy, ix in pts], dtype=np.float32)
     if np.hypot(*(pix[0] - pix[-1])) > 1e-6:
         pix = np.vstack([pix, pix[0]])
-    pix = _smooth_closed_curve(pix, window=7, passes=2)
+    if bool(smooth_output):
+        pix = _smooth_closed_curve(pix, window=7, passes=2)
     if np.hypot(*(pix[0] - pix[-1])) > 1e-6:
         pix = np.vstack([pix, pix[0]])
     return pix
@@ -1306,6 +1545,93 @@ def _normalize_closed_spline_xy(
     return arr.astype(np.float32, copy=False)
 
 
+def _catmull_rom_closed_interpolating(
+    spline_xy: np.ndarray | list | tuple,
+    samples_per_segment: int = 6,
+) -> np.ndarray | None:
+    """Closed Catmull-Rom interpolation that passes through every control point."""
+    arr = _coerce_spline_xy(spline_xy)
+    if arr is None:
+        return None
+
+    arr = _ensure_closed_curve(arr.astype(np.float32, copy=False))
+    if arr.shape[0] < 4:
+        return arr
+
+    pts = arr[:-1].astype(np.float64, copy=False)
+    n = int(pts.shape[0])
+    if n < 3:
+        return arr
+
+    sps = max(2, int(samples_per_segment))
+    t_values = np.linspace(0.0, 1.0, num=sps, endpoint=False, dtype=np.float64)
+    out: list[np.ndarray] = []
+
+    for i in range(n):
+        p0 = pts[(i - 1) % n]
+        p1 = pts[i % n]
+        p2 = pts[(i + 1) % n]
+        p3 = pts[(i + 2) % n]
+
+        for t in t_values:
+            t2 = t * t
+            t3 = t2 * t
+            # Uniform Catmull-Rom basis, interpolating p1 at t=0 and p2 at t=1.
+            q = 0.5 * (
+                (2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+            )
+            out.append(q)
+
+    out_arr = np.asarray(out, dtype=np.float32)
+    if out_arr.shape[0] < 2:
+        return _ensure_closed_curve(pts.astype(np.float32, copy=False))
+    out_arr = np.vstack([out_arr, out_arr[0]])
+    return out_arr.astype(np.float32, copy=False)
+
+
+def _anchor_closed_spline_points(
+    spline_xy: np.ndarray,
+    first_point_xy: tuple[float, float],
+    second_point_xy: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Rotate/orient a closed spline and pin first/second points to requested anchors."""
+    arr = _ensure_closed_curve(np.asarray(spline_xy, dtype=np.float32))
+    if arr.shape[0] < 4:
+        return arr.astype(np.float32, copy=False)
+
+    open_pts = arr[:-1].astype(np.float64, copy=False)
+    n = open_pts.shape[0]
+
+    first = np.asarray(first_point_xy, dtype=np.float64)
+    d2 = np.sum((open_pts - first[None, :]) ** 2, axis=1)
+    i0 = int(np.argmin(d2))
+
+    forward = np.roll(open_pts, -i0, axis=0)
+
+    reverse_base = open_pts[::-1]
+    i0_rev = (n - 1) - i0
+    reverse = np.roll(reverse_base, -i0_rev, axis=0)
+
+    chosen = forward
+    if second_point_xy is not None and n > 1:
+        second = np.asarray(second_point_xy, dtype=np.float64)
+        fwd_d = float(np.hypot(*(forward[1] - second)))
+        rev_d = float(np.hypot(*(reverse[1] - second)))
+        if rev_d < fwd_d:
+            chosen = reverse
+
+    chosen = chosen.copy()
+    chosen[0] = first
+    if second_point_xy is not None and n > 1:
+        chosen[1] = np.asarray(second_point_xy, dtype=np.float64)
+
+    closed = np.vstack([chosen, chosen[0]])
+    return closed.astype(np.float32, copy=False)
+
+
 def make_gaussian_window(size: int = 265, softness: float = 0.2) -> np.ndarray:
     # Match the window behavior used in the explorer: normalized coords over full width/height.
     half = size / 2.0
@@ -1329,6 +1655,540 @@ def nearest_coord_indices(length: int, coords: np.ndarray) -> np.ndarray:
     out = left.copy()
     out[choose_right] = right[choose_right]
     return out.astype(np.int32)
+
+
+def _hsv_background_predicate_mask(rgb: np.ndarray) -> np.ndarray:
+    """Background predicate from user-selected HSV bounds (u8 space)."""
+    hsv = rgb_to_hsv(np.clip(rgb, 0.0, 1.0).astype(np.float32))
+    hsv_u8 = np.clip(np.round(hsv * 255.0), 0, 255).astype(np.uint8)
+    h_u8_full = hsv_u8[..., 0]
+    s_u8_full = hsv_u8[..., 1]
+    v_u8_full = hsv_u8[..., 2]
+    return (
+        (h_u8_full >= 219) & (h_u8_full <= 242)
+        & (s_u8_full >= 100) & (s_u8_full <= 200)
+        & (v_u8_full >= 80) & (v_u8_full <= 250)
+    )
+
+
+def _sample_ring_states(
+    predicate_mask: np.ndarray,
+    center_y: int,
+    center_x: int,
+    radius_px: int,
+    n_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    angles = np.linspace(0.0, 2.0 * math.pi, num=max(16, int(n_samples)), endpoint=False, dtype=np.float64)
+    ys = np.rint(center_y + radius_px * np.sin(angles)).astype(np.int32)
+    xs = np.rint(center_x + radius_px * np.cos(angles)).astype(np.int32)
+    ys = np.clip(ys, 0, predicate_mask.shape[0] - 1)
+    xs = np.clip(xs, 0, predicate_mask.shape[1] - 1)
+    states = predicate_mask[ys, xs].astype(bool)
+    return ys, xs, states
+
+
+def _find_initial_point_from_center_line(predicate_mask: np.ndarray) -> tuple[int, int, str]:
+    """Find initial point where a center-line scan transitions background->foreground.
+
+    Starts from image edges on lines passing through the center and scans inward.
+    Background is predicate=True, foreground is predicate=False.
+    """
+    h, w = predicate_mask.shape
+    cy = h // 2
+    cx = w // 2
+
+    scans: list[tuple[str, list[tuple[int, int]]]] = [
+        ("center-row right->left", [(cy, x) for x in range(w - 1, -1, -1)]),
+        ("center-row left->right", [(cy, x) for x in range(0, w)]),
+        ("center-col bottom->top", [(y, cx) for y in range(h - 1, -1, -1)]),
+        ("center-col top->bottom", [(y, cx) for y in range(0, h)]),
+    ]
+
+    for label, line in scans:
+        if len(line) < 2:
+            continue
+        y0, x0 = line[0]
+        prev_bg = bool(predicate_mask[y0, x0])
+        for y, x in line[1:]:
+            curr_bg = bool(predicate_mask[y, x])
+            if prev_bg and (not curr_bg):
+                return int(y), int(x), label
+            prev_bg = curr_bg
+
+    # Fallback if no transition is found.
+    return int(cy), int(cx), "fallback-center"
+
+
+def _bridge_small_background_gaps(states: np.ndarray, max_bg_gap: int) -> np.ndarray:
+    """Treat short background runs between foreground runs as foreground."""
+    n = int(states.size)
+    if n == 0:
+        return states
+
+    out = np.asarray(states, dtype=bool).copy()
+    max_gap = max(0, int(max_bg_gap))
+    for _ in range(max(1, n)):
+        changed = False
+        runs = _circular_runs(out)
+        if not runs:
+            break
+        m = len(runs)
+        for i, (state, start, run_len) in enumerate(runs):
+            if state:
+                continue
+            left_fg = bool(runs[(i - 1) % m][0])
+            right_fg = bool(runs[(i + 1) % m][0])
+            if left_fg and right_fg and int(run_len) <= max_gap:
+                for k in range(int(run_len)):
+                    out[(int(start) + k) % n] = True
+                changed = True
+        if not changed:
+            break
+    return out
+
+
+def _circular_runs(states: np.ndarray) -> list[tuple[bool, int, int]]:
+    """Return circular runs as (state, start_index, length)."""
+    n = int(states.size)
+    if n == 0:
+        return []
+
+    runs: list[tuple[bool, int, int]] = []
+    start = 0
+    curr = bool(states[0])
+    for i in range(1, n):
+        v = bool(states[i])
+        if v != curr:
+            runs.append((curr, start, i - start))
+            start = i
+            curr = v
+    runs.append((curr, start, n - start))
+
+    if len(runs) > 1 and runs[0][0] == runs[-1][0]:
+        first = runs[0]
+        last = runs[-1]
+        runs[0] = (first[0], last[1], first[2] + last[2])
+        runs.pop()
+    return runs
+
+
+def _connected_component_from_seed(mask: np.ndarray, seed_y: int, seed_x: int) -> np.ndarray:
+    """Return 4-connected component mask grown from seed on a boolean mask."""
+    h, w = mask.shape
+    if seed_y < 0 or seed_x < 0 or seed_y >= h or seed_x >= w:
+        return np.zeros_like(mask, dtype=bool)
+    if not bool(mask[seed_y, seed_x]):
+        return np.zeros_like(mask, dtype=bool)
+
+    out = np.zeros_like(mask, dtype=bool)
+    q: deque[tuple[int, int]] = deque()
+    q.append((int(seed_y), int(seed_x)))
+    out[seed_y, seed_x] = True
+
+    while q:
+        y, x = q.popleft()
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if ny < 0 or nx < 0 or ny >= h or nx >= w:
+                continue
+            if out[ny, nx] or (not bool(mask[ny, nx])):
+                continue
+            out[ny, nx] = True
+            q.append((ny, nx))
+    return out
+
+
+def _extract_outer_contour_xy(component_mask: np.ndarray) -> np.ndarray | None:
+    """Extract largest closed contour (x,y) from a boolean component mask."""
+    if not np.any(component_mask):
+        return None
+
+    fig = plt.figure(figsize=(1, 1))
+    try:
+        cs = plt.contour(component_mask.astype(np.float32), levels=[0.5])
+        segs = cs.allsegs[0] if len(cs.allsegs) > 0 else []
+    finally:
+        plt.close(fig)
+
+    if not segs:
+        return None
+
+    best = max(segs, key=lambda s: s.shape[0])
+    xy = np.asarray(best, dtype=np.float32)
+    if xy.shape[0] < 3:
+        return None
+    xy = _ensure_closed_curve(xy)
+    xy = _smooth_closed_curve(xy, window=7, passes=2)
+    xy = _ensure_closed_curve(xy)
+    return xy.astype(np.float32)
+
+
+def _run_image_only_hsv_mode(
+    rgb: np.ndarray,
+    image_path: Path,
+    spline_out_path: Path,
+    ring_radius_px: int,
+    ring_samples: int,
+    max_bg_gap: int,
+    spline_style: str,
+) -> dict[str, object]:
+    predicate_mask = _hsv_background_predicate_mask(rgb)
+    h, w = predicate_mask.shape
+    init_y, init_x, init_scan_label = _find_initial_point_from_center_line(predicate_mask)
+
+    ys, xs, states_raw = _sample_ring_states(
+        predicate_mask=predicate_mask,
+        center_y=init_y,
+        center_x=init_x,
+        radius_px=max(1, int(ring_radius_px)),
+        n_samples=max(16, int(ring_samples)),
+    )
+    states = _bridge_small_background_gaps(states_raw, max_bg_gap=max(0, int(max_bg_gap)))
+    runs = _circular_runs(states)
+
+    bg_runs = [r for r in runs if r[0]]
+    fg_runs = [r for r in runs if not r[0]]
+    best_bg = max(bg_runs, key=lambda r: r[2]) if bg_runs else None
+    best_fg = max(fg_runs, key=lambda r: r[2]) if fg_runs else None
+
+    def _midpoint_from_run(run: tuple[bool, int, int] | None) -> tuple[int, int] | None:
+        if run is None:
+            return None
+        _state, st, ln = run
+        mid_idx = (st + ln // 2) % states.size
+        return int(ys[mid_idx]), int(xs[mid_idx])
+
+    bg_mid = _midpoint_from_run(best_bg)
+    fg_mid = _midpoint_from_run(best_fg)
+
+    transition_pt: tuple[int, int] | None = None
+    transition_idx: int | None = None
+    if states.size > 1:
+        for i in range(states.size):
+            prev_i = (i - 1) % states.size
+            if bool(states[i]) != bool(states[prev_i]):
+                transition_idx = int(i)
+                transition_pt = (int(ys[i]), int(xs[i]))
+                break
+
+    # Build outer spline using the same circular ring-transition sampling at each point.
+    # Bracelet foreground is predicate=False, map it to high values for threshold tracing.
+    seed_fg: tuple[int, int] | None = None
+    if not bool(predicate_mask[init_y, init_x]):
+        seed_fg = (int(init_y), int(init_x))
+    elif transition_idx is not None:
+        i = int(transition_idx)
+        prev_i = (i - 1) % states.size
+        fg_i: int | None = None
+        if not bool(states[i]):
+            fg_i = i
+        elif not bool(states[prev_i]):
+            fg_i = prev_i
+        if fg_i is not None:
+            seed_fg = (int(ys[fg_i]), int(xs[fg_i]))
+    elif fg_mid is not None:
+        seed_fg = (int(fg_mid[0]), int(fg_mid[1]))
+
+    use_catmull = str(spline_style).lower() in {"smooth", "catmull-rom", "catmull_rom", "catmullrom"}
+    catmull_samples_per_segment = 6
+
+    outer_control_xy: np.ndarray | None = None
+    outer_spline_xy: np.ndarray | None = None
+    inner_control_xy: np.ndarray | None = None
+    inner_spline_xy: np.ndarray | None = None
+    centerline_xy: np.ndarray | None = None
+    inner_start: tuple[int, int] | None = None
+    inner_intersects_outer = False
+    if seed_fg is not None:
+        foreground_map = np.where(predicate_mask, 0.0, 100.0).astype(np.float32)
+        traced = _trace_outer_spline_step_cells(
+            raw_map=foreground_map,
+            step=1,
+            threshold=50.0,
+            ring_steps=max(1, int(ring_radius_px)),
+            max_bg_gap=max(0, int(max_bg_gap)),
+            clockwise=True,
+            start_point=(int(seed_fg[0]), int(seed_fg[1])),
+            spline_label="outer",
+            return_partial_on_stop=True,
+            verbose=False,
+            smooth_output=False,
+        )
+        outer_control_xy = _normalize_closed_spline_xy(traced, min_open_points=0)
+        if outer_control_xy is not None:
+            first_xy = (float(init_x), float(init_y))
+            second_xy = (
+                (float(transition_pt[1]), float(transition_pt[0]))
+                if transition_pt is not None
+                else None
+            )
+            outer_control_xy = _anchor_closed_spline_points(
+                outer_control_xy,
+                first_point_xy=first_xy,
+                second_point_xy=second_xy,
+            )
+            outer_spline_xy = outer_control_xy
+            if use_catmull:
+                smooth_xy = _catmull_rom_closed_interpolating(
+                    outer_control_xy,
+                    samples_per_segment=catmull_samples_per_segment,
+                )
+                if smooth_xy is not None:
+                    outer_spline_xy = smooth_xy
+
+        ys_step, xs_step, coarse_step, _hi_step = _build_step_grid(
+            foreground_map,
+            step=1,
+            threshold=50.0,
+        )
+
+        outer_start_for_inner = (int(seed_fg[0]), int(seed_fg[1]))
+        if outer_control_xy is not None and outer_control_xy.shape[0] > 0:
+            # Point 0 of outer spline is stored in (x, y) pixel coordinates.
+            oy = int(round(float(outer_control_xy[0, 1])))
+            ox = int(round(float(outer_control_xy[0, 0])))
+            oy = int(np.clip(oy, 1, coarse_step.shape[0] - 2))
+            ox = int(np.clip(ox, 1, coarse_step.shape[1] - 2))
+            outer_start_for_inner = (oy, ox)
+
+        inner_start = _find_inner_start_from_outer_point0(
+            raw_map=foreground_map,
+            step=1,
+            threshold=50.0,
+            outer_start=outer_start_for_inner,
+            ys=ys_step,
+            xs=xs_step,
+            coarse=coarse_step,
+            start_radius=max(1, int(ring_radius_px)),
+        )
+        if inner_start is not None:
+            traced_inner = _trace_outer_spline_step_cells(
+                raw_map=foreground_map,
+                step=1,
+                threshold=50.0,
+                ring_steps=max(1, int(ring_radius_px)),
+                max_bg_gap=max(0, int(max_bg_gap)),
+                clockwise=True,
+                start_point=(int(inner_start[0]), int(inner_start[1])),
+                spline_label="inner",
+                return_partial_on_stop=True,
+                verbose=False,
+                smooth_output=False,
+            )
+            inner_control_xy = _normalize_closed_spline_xy(traced_inner, min_open_points=0)
+            inner_spline_xy = inner_control_xy
+            if inner_control_xy is not None and use_catmull:
+                smooth_inner = _catmull_rom_closed_interpolating(
+                    inner_control_xy,
+                    samples_per_segment=catmull_samples_per_segment,
+                )
+                if smooth_inner is not None:
+                    inner_spline_xy = smooth_inner
+
+            if outer_control_xy is not None and inner_control_xy is not None:
+                centerline_xy = _build_centerline_spline(outer_control_xy, inner_control_xy)
+                inner_intersects_outer = bool(_spline_intersects(outer_spline_xy, inner_spline_xy))
+
+    print("Image-only HSV mode")
+    print(f"  image={image_path}")
+    print(
+        f"  initial_point=(y={init_y}, x={init_x}) from {init_scan_label}, "
+        f"ring_radius_px={ring_radius_px}, samples={ring_samples}, spline_style={'catmull-rom' if use_catmull else 'polyline'}"
+    )
+    print(f"  background_true_pixels={int(np.count_nonzero(predicate_mask))}/{predicate_mask.size}")
+    if best_bg is not None:
+        print(f"  largest background run length={best_bg[2]} samples")
+    if best_fg is not None:
+        print(f"  largest bracelet run length={best_fg[2]} samples")
+    if outer_spline_xy is not None:
+        print(f"  outer spline points={outer_spline_xy.shape[0]}")
+    else:
+        print("  outer spline: unavailable (tracer did not produce a valid loop)")
+    if inner_start is not None:
+        print(
+            "  inner spline start "
+            f"grid(y={int(inner_start[0])}, x={int(inner_start[1])})"
+        )
+    else:
+        print("  inner spline start: unavailable")
+    if inner_spline_xy is not None:
+        print(f"  inner spline points={inner_spline_xy.shape[0]}")
+    else:
+        print("  inner spline: unavailable")
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.imshow(rgb, interpolation="nearest")
+    ax.set_title("Original image only: HSV ring classification")
+
+    bg_pts = states
+    fg_pts = ~states
+    ax.scatter(xs[bg_pts], ys[bg_pts], s=8, c="lime", alpha=0.75, label="background (predicate true)")
+    ax.scatter(xs[fg_pts], ys[fg_pts], s=8, c="red", alpha=0.75, label="bracelet (predicate false)")
+    ax.scatter([init_x], [init_y], s=55, c="cyan", edgecolors="black", linewidths=0.8, label="initial point")
+    if transition_pt is not None:
+        ax.scatter(
+            [transition_pt[1]],
+            [transition_pt[0]],
+            s=70,
+            c="blue",
+            edgecolors="white",
+            linewidths=0.9,
+            label="selected transition (2nd spline point)",
+        )
+    if bg_mid is not None:
+        ax.scatter([bg_mid[1]], [bg_mid[0]], s=80, c="yellow", edgecolors="black", linewidths=0.8, label="largest background")
+    if fg_mid is not None:
+        ax.scatter([fg_mid[1]], [fg_mid[0]], s=80, c="white", edgecolors="black", linewidths=0.8, label="largest bracelet")
+    if outer_spline_xy is not None:
+        ax.plot(outer_spline_xy[:, 0], outer_spline_xy[:, 1], color="white", linewidth=2.0, alpha=0.95, label="outer spline")
+        spline_pts = np.asarray(outer_control_xy if outer_control_xy is not None else outer_spline_xy, dtype=np.float64)
+        if spline_pts.shape[0] >= 2 and float(np.hypot(*(spline_pts[0] - spline_pts[-1]))) <= 1e-6:
+            spline_pts = spline_pts[:-1]
+        if spline_pts.shape[0] > 0:
+            spline_scatter = ax.scatter(
+                spline_pts[:, 0],
+                spline_pts[:, 1],
+                marker="o",
+                s=28,
+                facecolors="none",
+                edgecolors="white",
+                linewidths=0.9,
+                alpha=0.95,
+                label="spline points",
+            )
+            for i in range(0, spline_pts.shape[0], 10):
+                ax.text(
+                    float(spline_pts[i, 0]) + 2.0,
+                    float(spline_pts[i, 1]) + 2.0,
+                    str(i),
+                    color="white",
+                    fontsize=7,
+                    ha="left",
+                    va="bottom",
+                    bbox={"facecolor": "black", "alpha": 0.45, "pad": 0.2, "edgecolor": "none"},
+                )
+
+            hover_annot = ax.annotate(
+                "",
+                xy=(0.0, 0.0),
+                xytext=(10, 10),
+                textcoords="offset points",
+                fontsize=8,
+                color="white",
+                bbox={"facecolor": "black", "alpha": 0.75, "pad": 0.3, "edgecolor": "white"},
+            )
+            hover_annot.set_visible(False)
+
+            def _on_spline_hover(event) -> None:
+                if event.inaxes != ax:
+                    if hover_annot.get_visible():
+                        hover_annot.set_visible(False)
+                        fig.canvas.draw_idle()
+                    return
+                contains, info = spline_scatter.contains(event)
+                if (not contains) or ("ind" not in info) or (len(info["ind"]) == 0):
+                    if hover_annot.get_visible():
+                        hover_annot.set_visible(False)
+                        fig.canvas.draw_idle()
+                    return
+                idx = int(info["ind"][0])
+                px = float(spline_pts[idx, 0])
+                py = float(spline_pts[idx, 1])
+                hover_annot.xy = (px, py)
+                hover_annot.set_text(f"point {idx}\\n(x={px:.1f}, y={py:.1f})")
+                hover_annot.set_visible(True)
+                fig.canvas.draw_idle()
+
+            fig.canvas.mpl_connect("motion_notify_event", _on_spline_hover)
+    if inner_spline_xy is not None:
+        ax.plot(inner_spline_xy[:, 0], inner_spline_xy[:, 1], color="cyan", linewidth=1.6, alpha=0.95, label="inner spline")
+        inner_pts = np.asarray(inner_control_xy if inner_control_xy is not None else inner_spline_xy, dtype=np.float64)
+        if inner_pts.shape[0] >= 2 and float(np.hypot(*(inner_pts[0] - inner_pts[-1]))) <= 1e-6:
+            inner_pts = inner_pts[:-1]
+        if inner_pts.shape[0] > 0:
+            ax.scatter(
+                inner_pts[:, 0],
+                inner_pts[:, 1],
+                marker="o",
+                s=28,
+                facecolors="none",
+                edgecolors="cyan",
+                linewidths=0.9,
+                alpha=0.95,
+                label="inner spline points",
+            )
+    if centerline_xy is not None:
+        ax.plot(centerline_xy[:, 0], centerline_xy[:, 1], color="yellow", linewidth=1.4, alpha=0.9, label="centerline")
+        center_pts = np.asarray(centerline_xy, dtype=np.float64)
+        if center_pts.shape[0] >= 2 and float(np.hypot(*(center_pts[0] - center_pts[-1]))) <= 1e-6:
+            center_pts = center_pts[:-1]
+        if center_pts.shape[0] > 0:
+            ax.scatter(
+                center_pts[:, 0],
+                center_pts[:, 1],
+                marker="o",
+                s=28,
+                facecolors="none",
+                edgecolors="yellow",
+                linewidths=0.9,
+                alpha=0.95,
+                label="centerline points",
+            )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    backend = str(plt.get_backend()).lower()
+    noninteractive_backends = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+    is_noninteractive = backend in noninteractive_backends or backend.startswith("module://matplotlib_inline")
+    if is_noninteractive:
+        plt.close(fig)
+    else:
+        plt.show()
+
+    output = {
+        "version": 1,
+        "mode": "image_only_hsv",
+        "image_path": str(image_path),
+        "ring_radius_px": int(ring_radius_px),
+        "ring_samples": int(ring_samples),
+        "max_bg_gap": int(max_bg_gap),
+        "spline_style": "catmull-rom" if use_catmull else "polyline",
+        "initial_point": [int(init_x), int(init_y)],
+        "initial_point_source": str(init_scan_label),
+        "largest_background_run_samples": int(best_bg[2]) if best_bg is not None else 0,
+        "largest_bracelet_run_samples": int(best_fg[2]) if best_fg is not None else 0,
+        "largest_background_midpoint": [int(bg_mid[1]), int(bg_mid[0])] if bg_mid is not None else None,
+        "largest_bracelet_midpoint": [int(fg_mid[1]), int(fg_mid[0])] if fg_mid is not None else None,
+        "outer_spline": (
+            [[float(p[0]), float(p[1])] for p in np.asarray(outer_spline_xy, dtype=np.float64)]
+            if outer_spline_xy is not None
+            else None
+        ),
+        "outer_spline_control": (
+            [[float(p[0]), float(p[1])] for p in np.asarray(outer_control_xy, dtype=np.float64)]
+            if outer_control_xy is not None
+            else None
+        ),
+        "inner_spline": (
+            [[float(p[0]), float(p[1])] for p in np.asarray(inner_spline_xy, dtype=np.float64)]
+            if inner_spline_xy is not None
+            else None
+        ),
+        "inner_spline_control": (
+            [[float(p[0]), float(p[1])] for p in np.asarray(inner_control_xy, dtype=np.float64)]
+            if inner_control_xy is not None
+            else None
+        ),
+        "centerline_spline": (
+            [[float(p[0]), float(p[1])] for p in np.asarray(centerline_xy, dtype=np.float64)]
+            if centerline_xy is not None
+            else None
+        ),
+        "inner_intersects_outer": bool(inner_intersects_outer),
+    }
+    spline_out_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    print(f"Wrote spline file: {spline_out_path}")
+    return output
 
 
 def main() -> None:
@@ -1371,7 +2231,64 @@ def main() -> None:
         default=None,
         help="Optional debug start index for inner tracer.",
     )
+    parser.add_argument(
+        "--image-only-hsv",
+        action="store_true",
+        help=(
+            "Operate on original image only using HSV predicate instead of FFT-derived map. "
+            "Samples a ring around the initial point and finds contiguous background/bracelet regions."
+        ),
+    )
+    parser.add_argument(
+        "--ring-radius-px",
+        type=int,
+        default=64,
+        help="Ring radius in pixels for image-only HSV mode (default: 64).",
+    )
+    parser.add_argument(
+        "--ring-samples",
+        type=int,
+        default=720,
+        help="Number of evenly spaced samples on the ring in image-only HSV mode (default: 720).",
+    )
+    parser.add_argument(
+        "--max-bg-gap",
+        type=int,
+        default=14,
+        help=(
+            "Maximum short background run length to reclassify as foreground when it lies "
+            "between foreground runs (image-only HSV mode, default: 14)."
+        ),
+    )
+    parser.add_argument(
+        "--image-only-spline-style",
+        choices=["smooth", "polyline", "catmull-rom"],
+        default="smooth",
+        help="Spline style for image-only mode: smooth interpolating or polyline (default).",
+    )
     args = parser.parse_args()
+
+    if args.image_only_hsv:
+        if len(args.inputs) != 1:
+            parser.error("--image-only-hsv requires exactly one positional input: <image_path>.")
+        image_path = Path(args.inputs[0]).expanduser().resolve()
+        image_stem = image_path.stem
+        spline_out_path = (
+            Path(args.spline_out).expanduser().resolve()
+            if args.spline_out
+            else (Path.cwd() / f"{image_stem}_splines.json").resolve()
+        )
+        rgb, _ = load_image_and_luminance(str(image_path))
+        _run_image_only_hsv_mode(
+            rgb=rgb,
+            image_path=image_path,
+            spline_out_path=spline_out_path,
+            ring_radius_px=max(1, int(args.ring_radius_px)),
+            ring_samples=max(16, int(args.ring_samples)),
+            max_bg_gap=max(0, int(args.max_bg_gap)),
+            spline_style=str(args.image_only_spline_style),
+        )
+        return
 
     if len(args.inputs) == 1:
         image_input_path = Path(args.inputs[0]).expanduser().resolve()
@@ -1524,7 +2441,6 @@ def _show_map(
         figsize=(12, 6),
         sharex=True,
         sharey=True,
-        constrained_layout=True,
     )
 
     ax_src.imshow(rgb_source, interpolation="nearest")
@@ -1694,6 +2610,7 @@ def _show_map(
         f"step={step}, hp={hp_percent:.2f}%, metric={metric}, "
         f"processed={processed}/{total}"
     )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
 
     # Avoid axis("off") because some backends drop rich cursor readouts on hidden axes.
     for ax in (ax_src, ax_map):
