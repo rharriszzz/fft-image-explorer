@@ -434,6 +434,8 @@ def _find_centerline_start(
     hi: np.ndarray,
     ys: np.ndarray,
     xs: np.ndarray,
+    ring_steps: int = 4,
+    min_fg_count: int = 5,
 ) -> tuple[tuple[int, int] | None, list[tuple[int, int, float]]]:
     gh, gw = coarse.shape
     cy = gh // 2
@@ -441,6 +443,37 @@ def _find_centerline_start(
 
     start: tuple[int, int] | None = None
     start_scan_tail: list[tuple[int, int, float]] = []
+
+    # Build the same-radius ring offsets used by the tracer.
+    ring_offsets: list[tuple[float, int, int]] = []
+    r = float(max(1, int(ring_steps)))
+    for dy in range(-int(r) - 1, int(r) + 2):
+        for dx in range(-int(r) - 1, int(r) + 2):
+            if dx == 0 and dy == 0:
+                continue
+            d = math.hypot(dx, dy)
+            if abs(d - r) <= 0.75:
+                theta_local = math.atan2(-dy, dx)
+                sweep_angle = (2.0 * math.pi - theta_local) % (2.0 * math.pi)
+                ring_offsets.append((sweep_angle, dy, dx))
+    ring_offsets.sort(key=lambda t: t[0])
+
+    def _ring_midpoint_if_enough_fg(center_y: int, center_x: int) -> tuple[tuple[int, int] | None, int]:
+        fg_points: list[tuple[int, int]] = []
+        for _ang, dy, dx in ring_offsets:
+            ny = center_y + dy
+            nx = center_x + dx
+            if ny < 1 or nx < 1 or ny >= gh - 1 or nx >= gw - 1:
+                continue
+            if bool(hi[ny, nx]):
+                fg_points.append((ny, nx))
+                if len(fg_points) >= max(1, int(min_fg_count)):
+                    # User-requested rule: as soon as foreground-count reaches
+                    # threshold (e.g. 5), choose the middle of those first hits.
+                    mid = fg_points[int(min_fg_count) // 2]
+                    return (int(mid[0]), int(mid[1])), len(fg_points)
+        return None, len(fg_points)
+
     endpoint_orders = [
         [(cy, ix) for ix in range(gw - 1, -1, -1)],
         [(cy, ix) for ix in range(0, gw)],
@@ -451,9 +484,16 @@ def _find_centerline_start(
         scan_vals: list[tuple[int, int, float]] = []
         for iy, ix in line:
             scan_vals.append((iy, ix, float(coarse[iy, ix])))
-            if not hi[iy, ix]:
-                start = (iy, ix)
+            ring_mid, fg_count = _ring_midpoint_if_enough_fg(iy, ix)
+            if ring_mid is not None:
+                start = ring_mid
                 start_scan_tail = scan_vals[-5:]
+                print(
+                    "Initial start finder: selected ring midpoint from center-line scan "
+                    f"at grid(y={iy},x={ix}) with foreground_on_ring={fg_count} "
+                    f"(min_required={int(min_fg_count)}); "
+                    f"start grid(y={start[0]},x={start[1]})"
+                )
                 break
         if start is not None:
             break
@@ -756,6 +796,7 @@ def _trace_outer_spline_step_cells(
                 f"Tracer stop ({spline_label} spline): provided {spline_label} spline point is out of valid tracing bounds; "
                 f"grid(y={sy},x={sx})"
             )
+            _emit_trace_result("FAILED", "start_out_of_bounds", 0)
             return None
         start = (int(sy), int(sx))
         if verbose:
@@ -767,7 +808,14 @@ def _trace_outer_spline_step_cells(
             )
     else:
         # Start from one end of the centerline and move inward until value drops below threshold.
-        start, _ = _find_centerline_start(coarse=coarse, hi=hi, ys=ys, xs=xs)
+        start, _ = _find_centerline_start(
+            coarse=coarse,
+            hi=hi,
+            ys=ys,
+            xs=xs,
+            ring_steps=ring_steps,
+            min_fg_count=5,
+        )
     trace_output = False
 
     if start is None:
@@ -775,6 +823,7 @@ def _trace_outer_spline_step_cells(
             f"Tracer stop ({spline_label} spline): no start {spline_label} spline point found on center lines where raw<threshold; "
             f"threshold={threshold:.3f}"
         )
+        _emit_trace_result("FAILED", "no_start_point", 0)
         return None
 
     def is_transition(iy: int, ix: int) -> bool:
@@ -794,6 +843,7 @@ def _trace_outer_spline_step_cells(
                 ring_offsets.append((dy, dx))
     if not ring_offsets:
         print("Tracer stop: no ring offsets generated; check ring_steps value.")
+        _emit_trace_result("FAILED", "no_ring_offsets", 0)
         return None
 
     curr_y, curr_x = start
@@ -808,6 +858,12 @@ def _trace_outer_spline_step_cells(
     prev_dir: tuple[float, float] | None = None
     max_turn_rad = math.radians(90.0)
     stop_reason: str | None = None
+
+    def _emit_trace_result(kind: str, reason: str, points_count: int) -> None:
+        print(
+            f"Tracer result ({spline_label} spline): {kind}; "
+            f"reason={reason}; points={int(points_count)}"
+        )
 
     def _find_near_revisit_index(
         y: int,
@@ -864,7 +920,9 @@ def _trace_outer_spline_step_cells(
                 f"disk_hi={disk_hi}/{disk_n}, points_traced={len(pts)}"
             )
             if return_partial_on_stop:
+                _emit_trace_result("PARTIAL", "uniform_neighborhood", len(pts))
                 return _partial_trace_pixels()
+            _emit_trace_result("FAILED", "uniform_neighborhood", len(pts))
             return None
 
         best: tuple[int, int] | None = None
@@ -951,7 +1009,9 @@ def _trace_outer_spline_step_cells(
                 f"{spline_label} spline point grid(y={curr_y},x={curr_x})"
             )
             if return_partial_on_stop:
+                _emit_trace_result("PARTIAL", "insufficient_ring_samples", len(pts))
                 return _partial_trace_pixels()
+            _emit_trace_result("FAILED", "insufficient_ring_samples", len(pts))
             return None
 
         # Suppress isolated one-bin flips in the circular ring sequence so
@@ -1229,10 +1289,12 @@ def _trace_outer_spline_step_cells(
                     spline_point_index=len(pts) - 2,
                     spline_label=spline_label,
                     is_transition_fn=is_transition,
-                    wait_for_close=False,
+                    wait_for_close=True,
                 )
             if return_partial_on_stop:
+                _emit_trace_result("PARTIAL", "ring_transition_count_mismatch", len(pts))
                 return _partial_trace_pixels()
+            _emit_trace_result("FAILED", "ring_transition_count_mismatch", len(pts))
             return None
 
         if best is None:
@@ -1405,12 +1467,16 @@ def _trace_outer_spline_step_cells(
 
     if stop_reason is None:
         if return_partial_on_stop:
+            _emit_trace_result("PARTIAL", "unknown_stop", len(pts))
             return _partial_trace_pixels()
+        _emit_trace_result("FAILED", "unknown_stop", len(pts))
         return None
 
     if len(pts) < 16:
         if return_partial_on_stop:
+            _emit_trace_result("PARTIAL", f"{stop_reason}_too_short", len(pts))
             return _partial_trace_pixels()
+        _emit_trace_result("FAILED", f"{stop_reason}_too_short", len(pts))
         return None
 
     # Convert from step-grid indices to image pixel coordinates.
@@ -1421,6 +1487,10 @@ def _trace_outer_spline_step_cells(
         pix = _smooth_closed_curve(pix, window=7, passes=2)
     if np.hypot(*(pix[0] - pix[-1])) > 1e-6:
         pix = np.vstack([pix, pix[0]])
+    if stop_reason == "closed_loop":
+        _emit_trace_result("COMPLETE", stop_reason, len(pts))
+    else:
+        _emit_trace_result("PARTIAL", stop_reason, len(pts))
     return pix
 
 
@@ -2474,6 +2544,8 @@ def _show_map(
             hi=hi_step,
             ys=ys_step,
             xs=xs_step,
+            ring_steps=4,
+            min_fg_count=5,
         )
         _dbg(f"outer_start={outer_start}")
 
@@ -2497,7 +2569,7 @@ def _show_map(
             for ax in (ax_src, ax_map):
                 ax.plot(traced_outer[:, 0], traced_outer[:, 1], color="white", linewidth=2.0, alpha=0.95)
 
-        if outer_start is not None:
+        if outer_start is not None and traced_outer is not None:
             _dbg("searching inner_start from outer point 0")
             inner_start = _find_inner_start_from_outer_point0(
                 raw_map=out,
