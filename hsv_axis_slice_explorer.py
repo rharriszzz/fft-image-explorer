@@ -164,11 +164,12 @@ def main() -> None:
     im_color = None
     cbar_slice = None
 
-    def compute_window(center_x: float) -> tuple[int, int]:
+    def compute_window(center_x: float, circular: bool) -> tuple[int, int]:
         width = int(state["width"])
         center_i = int(np.clip(np.round(center_x), 0, 255))
         lo_i = center_i - ((width - 1) // 2)
-        lo_i = int(np.clip(lo_i, 0, 256 - width))
+        if not circular:
+            lo_i = int(np.clip(lo_i, 0, 256 - width))
         hi_i = lo_i + width
         return lo_i, hi_i
 
@@ -176,10 +177,31 @@ def main() -> None:
         nonlocal fig_slice, ax_slice, ax_color, im_slice, im_color, cbar_slice
 
         main_idx, main_name, x2_idx, y2_idx, x2_name, y2_name, axis_vals_local = get_axis_context()
-        lo_i, hi_i = compute_window(center_x)
+        is_hue_axis = main_idx == 0
+        lo_i, hi_i = compute_window(center_x, circular=is_hue_axis)
         lo = float(lo_i)
         hi = float(hi_i)
-        state["selected_x"] = float(0.5 * (lo + hi))
+
+        if is_hue_axis:
+            lo_mod = lo_i % 256
+            hi_mod = hi_i % 256
+            wraps = (lo_i < 0) or (hi_i > 256)
+            state["selected_x"] = float(np.clip(np.round(center_x), 0, 255))
+            if wraps:
+                range_text = f"[{lo_mod:.0f}, 256) U [0, {hi_mod:.0f})"
+                mask = (axis_vals_local >= lo_mod) | (axis_vals_local < hi_mod)
+            else:
+                range_text = f"[{lo_mod:.0f}, {hi_mod:.0f})"
+                mask = (axis_vals_local >= lo_mod) & (axis_vals_local < hi_mod)
+            line_min_x = float(lo_mod)
+            line_max_x = float(hi_mod)
+        else:
+            state["selected_x"] = float(0.5 * (lo + hi))
+            range_text = f"[{lo:.0f}, {hi:.0f})"
+            mask = (axis_vals_local >= lo_i) & (axis_vals_local < hi_i)
+            line_min_x = float(lo_i)
+            line_max_x = float(hi_i)
+
         if int(state["width"]) == 1:
             selected_line.set_xdata([state["selected_x"], state["selected_x"]])
             selected_line.set_visible(True)
@@ -187,12 +209,10 @@ def main() -> None:
             selected_line_max.set_visible(False)
         else:
             selected_line.set_visible(False)
-            selected_line_min.set_xdata([float(lo_i), float(lo_i)])
-            selected_line_max.set_xdata([float(hi_i), float(hi_i)])
+            selected_line_min.set_xdata([line_min_x, line_min_x])
+            selected_line_max.set_xdata([line_max_x, line_max_x])
             selected_line_min.set_visible(True)
             selected_line_max.set_visible(True)
-
-        mask = (axis_vals_local >= lo_i) & (axis_vals_local < hi_i)
         n_selected = int(np.count_nonzero(mask))
 
         x2 = channels[x2_idx][mask]
@@ -213,6 +233,8 @@ def main() -> None:
         y_centers_2d = 0.5 * (y_edges[:-1] + y_edges[1:])
         x_grid, y_grid = np.meshgrid(x_centers_2d, y_centers_2d)
         fixed_main_val = float(state["selected_x"])
+        if is_hue_axis:
+            fixed_main_val = float(fixed_main_val % 256.0)
         hsv_plane = np.zeros((bins_2d, bins_2d, 3), dtype=np.float32)
         hsv_plane[..., main_idx] = np.clip(fixed_main_val / 255.0, 0.0, 1.0)
         hsv_plane[..., x2_idx] = np.clip(x_grid / 255.0, 0.0, 1.0)
@@ -263,7 +285,7 @@ def main() -> None:
             ax_color.set_ylabel(y2_name)
 
         ax_slice.set_title(
-            f"{main_name} in [{lo:.0f}, {hi:.0f}) | width={int(state['width'])} | "
+            f"{main_name} in {range_text} | width={int(state['width'])} | "
             f"pixels={n_selected}, max_bin_count={max_count_2d}"
         )
         ax_color.set_title(f"HSV colors at {main_name}={fixed_main_val:.1f}")
