@@ -12,6 +12,12 @@ Controls:
 - Value center + width
 
 Left-click on the original image to set H/S/V centers from that pixel.
+
+Optional preset mode:
+- Union of:
+    1) red: 242 <= H <= 262 and V >= 128 (wraps to H<=6)
+    2) yellow: 8 <= H <= 44
+    3) black: V <= 64
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
-from matplotlib.widgets import Slider
+from matplotlib.widgets import CheckButtons, Slider
 from PIL import Image, ImageOps
 
 
@@ -61,6 +67,19 @@ def channel_window_mask(values_u8: np.ndarray, center: int, width: int, circular
     return (vals >= lo_clamped) & (vals < hi_clamped)
 
 
+def _hsv_preset_components(h_u8: np.ndarray, v_u8: np.ndarray) -> dict[str, np.ndarray]:
+    # Condition 1: red hue range with minimum value (wrapped 242..262).
+    red = ((h_u8 >= 242) | (h_u8 <= 6)) & (v_u8 >= 128)
+
+    # Condition 2: yellow hue range.
+    yellow = (h_u8 >= 8) & (h_u8 <= 44)
+
+    # Condition 3: black by value threshold.
+    black = v_u8 <= 64
+
+    return {"red": red, "yellow": yellow, "black": black}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive HSV mask viewer with center/width controls.")
     parser.add_argument("image", help="Path to input image")
@@ -70,6 +89,14 @@ def main() -> None:
     parser.add_argument("--s-width", type=int, default=64, help="Initial saturation width (1..256)")
     parser.add_argument("--v", type=int, default=128, help="Initial value center (0..255)")
     parser.add_argument("--v-width", type=int, default=64, help="Initial value width (1..256)")
+    parser.add_argument(
+        "--preset-union-mask",
+        action="store_true",
+        help=(
+            "Use fixed union mask: red(H 242..262 wrap, V>=128) OR yellow(H 8..44) OR black(V<=64). "
+            "When enabled, slider values do not affect mask output."
+        ),
+    )
     args = parser.parse_args()
 
     image_path = Path(args.image).expanduser().resolve()
@@ -125,6 +152,14 @@ def main() -> None:
     slider_sw = Slider(slider_sw_ax, "Sat width", 1, 256, valinit=int(np.clip(args.s_width, 1, 256)), valstep=1)
     slider_v = Slider(slider_v_ax, "Val", 0, 255, valinit=int(np.clip(args.v, 0, 255)), valstep=1)
     slider_vw = Slider(slider_vw_ax, "Val width", 1, 256, valinit=int(np.clip(args.v_width, 1, 256)), valstep=1)
+
+    preset_components = _hsv_preset_components(h_ch, v_ch)
+    preset_enabled = {"red": True, "yellow": True, "black": True}
+    preset_checks = None
+    if args.preset_union_mask:
+        checks_ax = fig.add_axes([0.82, 0.73, 0.15, 0.14])
+        preset_checks = CheckButtons(checks_ax, ["red", "yellow", "black"], [True, True, True])
+        checks_ax.set_title("Preset parts", fontsize=9)
 
     x_vals = np.linspace(0.0, 1.0, num=256, dtype=np.float32)
 
@@ -184,10 +219,16 @@ def main() -> None:
         v_strip_hsv[0, :, 2] = x_vals
         im_v_preview.set_data(hsv_to_rgb(v_strip_hsv))
 
-        h_mask = channel_window_mask(h_ch, h_center, h_width, circular=True)
-        s_mask = channel_window_mask(s_ch, s_center, s_width, circular=False)
-        v_mask = channel_window_mask(v_ch, v_center, v_width, circular=False)
-        mask = h_mask & s_mask & v_mask
+        if args.preset_union_mask:
+            mask = np.zeros(h_ch.shape, dtype=bool)
+            for k, on in preset_enabled.items():
+                if on:
+                    mask |= preset_components[k]
+        else:
+            h_mask = channel_window_mask(h_ch, h_center, h_width, circular=True)
+            s_mask = channel_window_mask(s_ch, s_center, s_width, circular=False)
+            v_mask = channel_window_mask(v_ch, v_center, v_width, circular=False)
+            mask = h_mask & s_mask & v_mask
 
         masked_img_local = rgb.copy()
         masked_img_local[mask] = 1.0
@@ -203,13 +244,24 @@ def main() -> None:
         pct = 100.0 * (selected / float(max(total, 1)))
         ax_masked_white.set_title("Masked pixels set to white")
         ax_unmasked_white.set_title("Unmasked pixels set to white")
-        fig.suptitle(
-            (
-                f"H={h_center}±w{h_width} (wrap), S={s_center}±w{s_width}, V={v_center}±w{v_width}"
-                f" | mask true={selected}, mask false={unselected}, true%={pct:.2f}"
-            ),
-            fontsize=11,
-        )
+        if args.preset_union_mask:
+            enabled_names = [k for k, on in preset_enabled.items() if on]
+            enabled_text = ",".join(enabled_names) if enabled_names else "none"
+            fig.suptitle(
+                (
+                    "Preset mask: [red(H 242..262 wrap AND V>=128)] OR [yellow(H 8..44)] OR [black(V<=64)]"
+                    f" | enabled={enabled_text} | mask true={selected}, mask false={unselected}, true%={pct:.2f}"
+                ),
+                fontsize=11,
+            )
+        else:
+            fig.suptitle(
+                (
+                    f"H={h_center}±w{h_width} (wrap), S={s_center}±w{s_width}, V={v_center}±w{v_width}"
+                    f" | mask true={selected}, mask false={unselected}, true%={pct:.2f}"
+                ),
+                fontsize=11,
+            )
         fig.canvas.draw_idle()
 
     def on_slider_change(_val: float) -> None:
@@ -221,6 +273,14 @@ def main() -> None:
     slider_sw.on_changed(on_slider_change)
     slider_v.on_changed(on_slider_change)
     slider_vw.on_changed(on_slider_change)
+
+    def on_preset_toggle(label: str) -> None:
+        if label in preset_enabled:
+            preset_enabled[label] = not preset_enabled[label]
+            update_views()
+
+    if preset_checks is not None:
+        preset_checks.on_clicked(on_preset_toggle)
 
     def on_click(event) -> None:
         if event.inaxes != ax_orig or getattr(event, "button", None) != 1:

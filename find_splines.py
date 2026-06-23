@@ -1756,6 +1756,19 @@ def _hsv_background_predicate_mask(rgb: np.ndarray) -> np.ndarray:
     )
 
 
+def _hsv_preset_union_mask(rgb: np.ndarray) -> np.ndarray:
+    """Preset union mask from hsv_mask_triptych (True means selected/foreground)."""
+    hsv = rgb_to_hsv(np.clip(rgb, 0.0, 1.0).astype(np.float32))
+    hsv_u8 = np.clip(np.round(hsv * 255.0), 0, 255).astype(np.uint8)
+    h_u8 = hsv_u8[..., 0]
+    v_u8 = hsv_u8[..., 2]
+
+    red = ((h_u8 >= 242) | (h_u8 <= 6)) & (v_u8 >= 128)
+    yellow = (h_u8 >= 8) & (h_u8 <= 44)
+    black = v_u8 <= 64
+    return red | yellow | black
+
+
 def _sample_ring_states(
     predicate_mask: np.ndarray,
     center_y: int,
@@ -1915,8 +1928,17 @@ def _run_image_only_hsv_mode(
     ring_samples: int,
     max_bg_gap: int,
     spline_style: str,
+    use_preset_union_mask: bool,
 ) -> dict[str, object]:
-    predicate_mask = _hsv_background_predicate_mask(rgb)
+    if bool(use_preset_union_mask):
+        union_mask = _hsv_preset_union_mask(rgb)
+        # Existing tracing expects predicate=True as background.
+        predicate_mask = ~union_mask
+        predicate_mode = "preset_union_mask_inverted"
+    else:
+        predicate_mask = _hsv_background_predicate_mask(rgb)
+        predicate_mode = "legacy_hsv_box"
+
     h, w = predicate_mask.shape
     init_y, init_x, init_scan_label = _find_initial_point_from_center_line(predicate_mask)
 
@@ -2082,6 +2104,7 @@ def _run_image_only_hsv_mode(
 
     print("Image-only HSV mode")
     print(f"  image={image_path}")
+    print(f"  predicate_mode={predicate_mode}")
     print(
         f"  initial_point=(y={init_y}, x={init_x}) from {init_scan_label}, "
         f"ring_radius_px={ring_radius_px}, samples={ring_samples}, spline_style={'catmull-rom' if use_catmull else 'polyline'}"
@@ -2310,6 +2333,7 @@ def _run_image_only_hsv_mode(
     output = {
         "version": 1,
         "mode": "image_only_hsv",
+        "predicate_mode": str(predicate_mode),
         "image_path": str(image_path),
         "ring_radius_px": int(ring_radius_px),
         "ring_samples": int(ring_samples),
@@ -2407,6 +2431,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--image-only-hsv-preset-union-mask",
+        action="store_true",
+        help=(
+            "In --image-only-hsv mode, use preset union mask from hsv_mask_triptych "
+            "(red H 242..262 wrap with V>=128, yellow H 8..44, black V<=64)."
+        ),
+    )
+    parser.add_argument(
         "--ring-radius-px",
         type=int,
         default=64,
@@ -2454,6 +2486,7 @@ def main() -> None:
             ring_samples=max(16, int(args.ring_samples)),
             max_bg_gap=max(0, int(args.max_bg_gap)),
             spline_style=str(args.image_only_spline_style),
+            use_preset_union_mask=bool(args.image_only_hsv_preset_union_mask),
         )
         return
 
