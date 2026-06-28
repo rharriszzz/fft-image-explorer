@@ -14,10 +14,8 @@ Controls:
 Left-click on the original image to set H/S/V centers from that pixel.
 
 Optional preset mode:
-- Union of:
-    1) red: 242 <= H <= 262 and V >= 128 (wraps to H<=6)
-    2) yellow: 8 <= H <= 44
-    3) black: V <= 64
+- Uses a named preset profile made of toggleable HSV rectangles.
+- All enabled rectangles are unioned into the mask.
 """
 
 from __future__ import annotations
@@ -30,6 +28,68 @@ import numpy as np
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
 from matplotlib.widgets import CheckButtons, Slider
 from PIL import Image, ImageOps
+
+
+PRESET_PROFILES: dict[str, dict[str, dict[str, object]]] = {
+    "beads-photo-2": {
+        "red": {
+            "h": [(242, 255), (0, 6)],
+            "s": (0, 255),
+            "v": (128, 255),
+            "role": "fg",
+        },
+        "yellow": {
+            "h": [(8, 44)],
+            "s": (0, 255),
+            "v": (0, 255),
+            "role": "fg",
+        },
+        "black": {
+            "h": [(0, 255)],
+            "s": (0, 255),
+            "v": (0, 64),
+            "role": "fg",
+        },
+    },
+    "beads-photo-2-wb": {
+        "yellow": {
+            "h": [(22, 29)],
+            "s": (196, 255),
+            "v": (122, 250),
+            "role": "fg",
+        },
+        "red": {
+            "h": [(0, 5), (254, 255)],
+            "s": (75, 217),
+            "v": (43, 255),
+            "role": "fg",
+        },
+        "black": {
+            "h": [(0, 45), (240, 255)],
+            "s": (80, 200),
+            "v": (0, 30),
+            "role": "fg",
+        },
+        "shadow": {
+            "h": [(0, 36), (250, 255)],
+            "s": (35, 180),
+            "v": (31, 109),
+            "role": "bg",
+        },
+        "edge": {
+            "h": [(5, 36)],
+            "s": (35, 140),
+            "v": (110, 190),
+            "role": "bg",
+        },
+        "background": {
+            "h": [(10, 32)],
+            "s": (28, 75),
+            "v": (130, 255),
+            "role": "bg",
+        },
+    },
+}
 
 
 def load_image_rgb(path: str) -> np.ndarray:
@@ -67,17 +127,33 @@ def channel_window_mask(values_u8: np.ndarray, center: int, width: int, circular
     return (vals >= lo_clamped) & (vals < hi_clamped)
 
 
-def _hsv_preset_components(h_u8: np.ndarray, v_u8: np.ndarray) -> dict[str, np.ndarray]:
-    # Condition 1: red hue range with minimum value (wrapped 242..262).
-    red = ((h_u8 >= 242) | (h_u8 <= 6)) & (v_u8 >= 128)
+def _build_interval_mask(values: np.ndarray, intervals: list[tuple[int, int]]) -> np.ndarray:
+    out = np.zeros(values.shape, dtype=bool)
+    vals = values.astype(np.int16, copy=False)
+    for lo, hi in intervals:
+        lo_i = int(np.clip(lo, 0, 255))
+        hi_i = int(np.clip(hi, 0, 255))
+        if hi_i < lo_i:
+            continue
+        out |= (vals >= lo_i) & (vals <= hi_i)
+    return out
 
-    # Condition 2: yellow hue range.
-    yellow = (h_u8 >= 8) & (h_u8 <= 44)
 
-    # Condition 3: black by value threshold.
-    black = v_u8 <= 64
+def _hsv_preset_component_masks(hsv_u8: np.ndarray, profile_name: str) -> dict[str, np.ndarray]:
+    profile = PRESET_PROFILES[profile_name]
+    h_u8 = hsv_u8[..., 0]
+    s_u8 = hsv_u8[..., 1]
+    v_u8 = hsv_u8[..., 2]
 
-    return {"red": red, "yellow": yellow, "black": black}
+    out: dict[str, np.ndarray] = {}
+    for name, spec in profile.items():
+        h_mask = _build_interval_mask(h_u8, list(spec["h"]))
+        s0, s1 = tuple(spec["s"])
+        v0, v1 = tuple(spec["v"])
+        s_mask = (s_u8 >= int(s0)) & (s_u8 <= int(s1))
+        v_mask = (v_u8 >= int(v0)) & (v_u8 <= int(v1))
+        out[name] = h_mask & s_mask & v_mask
+    return out
 
 
 def main() -> None:
@@ -93,9 +169,15 @@ def main() -> None:
         "--preset-union-mask",
         action="store_true",
         help=(
-            "Use fixed union mask: red(H 242..262 wrap, V>=128) OR yellow(H 8..44) OR black(V<=64). "
+            "Use preset profile mask with toggleable parts. "
             "When enabled, slider values do not affect mask output."
         ),
+    )
+    parser.add_argument(
+        "--preset-profile",
+        choices=sorted(PRESET_PROFILES.keys()),
+        default="beads-photo-2",
+        help="Preset profile name for --preset-union-mask.",
     )
     args = parser.parse_args()
 
@@ -107,7 +189,13 @@ def main() -> None:
     s_ch = hsv_u8[..., 1]
     v_ch = hsv_u8[..., 2]
 
-    fig, (ax_orig, ax_masked_white, ax_unmasked_white) = plt.subplots(1, 3, figsize=(16, 7))
+    fig, (ax_orig, ax_masked_white, ax_unmasked_white) = plt.subplots(
+        1,
+        3,
+        figsize=(16, 7),
+        sharex=True,
+        sharey=True,
+    )
     fig.subplots_adjust(left=0.04, right=0.98, top=0.90, bottom=0.30, wspace=0.03)
 
     im_orig = ax_orig.imshow(rgb, interpolation="nearest")
@@ -153,12 +241,59 @@ def main() -> None:
     slider_v = Slider(slider_v_ax, "Val", 0, 255, valinit=int(np.clip(args.v, 0, 255)), valstep=1)
     slider_vw = Slider(slider_vw_ax, "Val width", 1, 256, valinit=int(np.clip(args.v_width, 1, 256)), valstep=1)
 
-    preset_components = _hsv_preset_components(h_ch, v_ch)
-    preset_enabled = {"red": True, "yellow": True, "black": True}
+    preset_components = _hsv_preset_component_masks(hsv_u8=hsv_u8, profile_name=str(args.preset_profile))
+    preset_parts = PRESET_PROFILES[str(args.preset_profile)]
+    preset_names = list(preset_parts.keys())
+    preset_enabled = {name: True for name in preset_names}
+
+    def _value_in_intervals(value: int, intervals: list[tuple[int, int]]) -> bool:
+        for lo, hi in intervals:
+            if int(lo) <= value <= int(hi):
+                return True
+        return False
+
+    def _format_coord_hsv(x: float, y: float) -> str:
+        xi = int(np.round(x))
+        yi = int(np.round(y))
+        if xi < 0 or yi < 0 or yi >= hsv_u8.shape[0] or xi >= hsv_u8.shape[1]:
+            return f"x={x:.1f}, y={y:.1f}"
+
+        h0, s0, v0 = hsv_u8[yi, xi]
+        text = f"x={xi}, y={yi}, HSV=({int(h0)},{int(s0)},{int(v0)})"
+
+        if args.preset_union_mask:
+            matched: list[str] = []
+            enabled_matched: list[str] = []
+            for name in preset_names:
+                spec = preset_parts[name]
+                s0_lo, s0_hi = tuple(spec["s"])
+                v0_lo, v0_hi = tuple(spec["v"])
+                ok = (
+                    _value_in_intervals(int(h0), list(spec["h"]))
+                    and int(s0_lo) <= int(s0) <= int(s0_hi)
+                    and int(v0_lo) <= int(v0) <= int(v0_hi)
+                )
+                if ok:
+                    matched.append(name)
+                    if preset_enabled.get(name, False):
+                        enabled_matched.append(name)
+
+            matched_text = ",".join(matched) if matched else "none"
+            enabled_text = ",".join(enabled_matched) if enabled_matched else "none"
+            text += f" | matches={matched_text} | enabled_matches={enabled_text}"
+
+        return text
+
+    ax_orig.format_coord = _format_coord_hsv
+    ax_masked_white.format_coord = _format_coord_hsv
+    ax_unmasked_white.format_coord = _format_coord_hsv
+
     preset_checks = None
     if args.preset_union_mask:
-        checks_ax = fig.add_axes([0.82, 0.73, 0.15, 0.14])
-        preset_checks = CheckButtons(checks_ax, ["red", "yellow", "black"], [True, True, True])
+        checks_h = min(0.28, 0.06 + 0.03 * len(preset_names))
+        checks_y = 0.90 - checks_h
+        checks_ax = fig.add_axes([0.78, checks_y, 0.20, checks_h])
+        preset_checks = CheckButtons(checks_ax, preset_names, [True] * len(preset_names))
         checks_ax.set_title("Preset parts", fontsize=9)
 
     x_vals = np.linspace(0.0, 1.0, num=256, dtype=np.float32)
@@ -222,8 +357,9 @@ def main() -> None:
         if args.preset_union_mask:
             mask = np.zeros(h_ch.shape, dtype=bool)
             for k, on in preset_enabled.items():
-                if on:
-                    mask |= preset_components[k]
+                if not on:
+                    continue
+                mask |= preset_components[k]
         else:
             h_mask = channel_window_mask(h_ch, h_center, h_width, circular=True)
             s_mask = channel_window_mask(s_ch, s_center, s_width, circular=False)
@@ -245,12 +381,13 @@ def main() -> None:
         ax_masked_white.set_title("Masked pixels set to white")
         ax_unmasked_white.set_title("Unmasked pixels set to white")
         if args.preset_union_mask:
-            enabled_names = [k for k, on in preset_enabled.items() if on]
+            enabled_names = [k for k in preset_names if preset_enabled[k]]
             enabled_text = ",".join(enabled_names) if enabled_names else "none"
             fig.suptitle(
                 (
-                    "Preset mask: [red(H 242..262 wrap AND V>=128)] OR [yellow(H 8..44)] OR [black(V<=64)]"
-                    f" | enabled={enabled_text} | mask true={selected}, mask false={unselected}, true%={pct:.2f}"
+                    f"Preset profile={args.preset_profile} (mask = union(enabled parts))"
+                    f" | enabled={enabled_text}"
+                    f" | mask true={selected}, mask false={unselected}, true%={pct:.2f}"
                 ),
                 fontsize=11,
             )
