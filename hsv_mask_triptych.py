@@ -26,7 +26,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
-from matplotlib.widgets import CheckButtons, Slider
+from matplotlib.widgets import CheckButtons, RadioButtons, Slider
 from PIL import Image, ImageOps
 
 
@@ -53,15 +53,27 @@ PRESET_PROFILES: dict[str, dict[str, dict[str, object]]] = {
     },
     "beads-photo-2-wb": {
         "yellow": {
-            "h": [(22, 29)],
+            "h": [(18, 29)],
             "s": (196, 255),
-            "v": (122, 250),
+            "v": (100, 250),
             "role": "fg",
         },
         "red": {
             "h": [(0, 5), (254, 255)],
-            "s": (75, 217),
-            "v": (43, 255),
+            "s": (141, 255),
+            "v": (110, 255),
+            "role": "fg",
+        },
+        "red-and-shadow": {
+            "h": [(0, 5), (254, 255)],
+            "s": (75, 180),
+            "v": (43, 109),
+            "role": "fg",
+        },
+        "red-and-edge": {
+            "h": [(5, 5)],
+            "s": (75, 140),
+            "v": (110, 190),
             "role": "fg",
         },
         "black": {
@@ -179,6 +191,14 @@ def main() -> None:
         default="beads-photo-2",
         help="Preset profile name for --preset-union-mask.",
     )
+    parser.add_argument(
+        "--preset-overlap-explorer",
+        action="store_true",
+        help=(
+            "Enable overlap exploration controls in preset mode: union(enabled), "
+            "intersection(enabled), or exactly-N matches among enabled parts."
+        ),
+    )
     args = parser.parse_args()
 
     image_path = Path(args.image).expanduser().resolve()
@@ -196,7 +216,8 @@ def main() -> None:
         sharex=True,
         sharey=True,
     )
-    fig.subplots_adjust(left=0.04, right=0.98, top=0.90, bottom=0.30, wspace=0.03)
+    right_margin = 0.74 if args.preset_union_mask else 0.98
+    fig.subplots_adjust(left=0.04, right=right_margin, top=0.90, bottom=0.30, wspace=0.03)
 
     im_orig = ax_orig.imshow(rgb, interpolation="nearest")
     _ = im_orig
@@ -245,6 +266,8 @@ def main() -> None:
     preset_parts = PRESET_PROFILES[str(args.preset_profile)]
     preset_names = list(preset_parts.keys())
     preset_enabled = {name: True for name in preset_names}
+    overlap_mode = {"value": "union"}
+    overlap_n = {"value": 2}
 
     def _value_in_intervals(value: int, intervals: list[tuple[int, int]]) -> bool:
         for lo, hi in intervals:
@@ -289,12 +312,37 @@ def main() -> None:
     ax_unmasked_white.format_coord = _format_coord_hsv
 
     preset_checks = None
+    overlap_radio = None
+    overlap_n_slider = None
     if args.preset_union_mask:
         checks_h = min(0.28, 0.06 + 0.03 * len(preset_names))
         checks_y = 0.90 - checks_h
-        checks_ax = fig.add_axes([0.78, checks_y, 0.20, checks_h])
+        if args.preset_overlap_explorer:
+            checks_y = 0.66
+        checks_ax = fig.add_axes([0.76, checks_y, 0.22, checks_h])
         preset_checks = CheckButtons(checks_ax, preset_names, [True] * len(preset_names))
         checks_ax.set_title("Preset parts", fontsize=9)
+
+        if args.preset_overlap_explorer:
+            radio_ax = fig.add_axes([0.76, 0.52, 0.22, 0.12])
+            overlap_radio = RadioButtons(
+                radio_ax,
+                ["union(enabled)", "intersection(enabled)", "exactly N matches"],
+                active=0,
+            )
+            radio_ax.set_title("Overlap mode", fontsize=9)
+
+            n_init = int(np.clip(overlap_n["value"], 1, max(1, len(preset_names))))
+            overlap_n["value"] = n_init
+            n_ax = fig.add_axes([0.76, 0.47, 0.22, 0.03])
+            overlap_n_slider = Slider(
+                n_ax,
+                "N",
+                1,
+                max(1, len(preset_names)),
+                valinit=n_init,
+                valstep=1,
+            )
 
     x_vals = np.linspace(0.0, 1.0, num=256, dtype=np.float32)
 
@@ -355,11 +403,31 @@ def main() -> None:
         im_v_preview.set_data(hsv_to_rgb(v_strip_hsv))
 
         if args.preset_union_mask:
-            mask = np.zeros(h_ch.shape, dtype=bool)
+            enabled_masks: list[np.ndarray] = []
             for k, on in preset_enabled.items():
                 if not on:
                     continue
-                mask |= preset_components[k]
+                enabled_masks.append(preset_components[k])
+
+            if not enabled_masks:
+                mask = np.zeros(h_ch.shape, dtype=bool)
+                overlap_count = np.zeros(h_ch.shape, dtype=np.uint8)
+            else:
+                overlap_count = np.zeros(h_ch.shape, dtype=np.uint8)
+                for m in enabled_masks:
+                    overlap_count += m.astype(np.uint8)
+
+                if args.preset_overlap_explorer:
+                    mode = str(overlap_mode["value"])
+                    if mode == "intersection":
+                        mask = overlap_count == len(enabled_masks)
+                    elif mode == "exactly_n":
+                        n_target = int(np.clip(overlap_n["value"], 1, len(enabled_masks)))
+                        mask = overlap_count == n_target
+                    else:
+                        mask = overlap_count >= 1
+                else:
+                    mask = overlap_count >= 1
         else:
             h_mask = channel_window_mask(h_ch, h_center, h_width, circular=True)
             s_mask = channel_window_mask(s_ch, s_center, s_width, circular=False)
@@ -383,10 +451,20 @@ def main() -> None:
         if args.preset_union_mask:
             enabled_names = [k for k in preset_names if preset_enabled[k]]
             enabled_text = ",".join(enabled_names) if enabled_names else "none"
+
+            extra = ""
+            if args.preset_overlap_explorer:
+                mode = str(overlap_mode["value"])
+                if mode == "exactly_n":
+                    extra = f" | mode=exactly_n({int(overlap_n['value'])})"
+                else:
+                    extra = f" | mode={mode}"
+
             fig.suptitle(
                 (
                     f"Preset profile={args.preset_profile} (mask = union(enabled parts))"
                     f" | enabled={enabled_text}"
+                    f"{extra}"
                     f" | mask true={selected}, mask false={unselected}, true%={pct:.2f}"
                 ),
                 fontsize=11,
@@ -418,6 +496,26 @@ def main() -> None:
 
     if preset_checks is not None:
         preset_checks.on_clicked(on_preset_toggle)
+
+    def on_overlap_mode(label: str) -> None:
+        lab = str(label).strip().lower()
+        if "intersection" in lab:
+            overlap_mode["value"] = "intersection"
+        elif "exactly" in lab:
+            overlap_mode["value"] = "exactly_n"
+        else:
+            overlap_mode["value"] = "union"
+        update_views()
+
+    if overlap_radio is not None:
+        overlap_radio.on_clicked(on_overlap_mode)
+
+    def on_overlap_n_change(val: float) -> None:
+        overlap_n["value"] = int(np.clip(np.round(val), 1, max(1, len(preset_names))))
+        update_views()
+
+    if overlap_n_slider is not None:
+        overlap_n_slider.on_changed(on_overlap_n_change)
 
     def on_click(event) -> None:
         if event.inaxes != ax_orig or getattr(event, "button", None) != 1:
