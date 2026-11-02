@@ -10,6 +10,8 @@ On the right side of the necklace (saved centerline point 5), the cyan circles m
 
 [Generation details and numerical conventions](docs/fft-figures.md) · [Three candidate figures](docs/figures/local-fft-candidates.png)
 
+For a compact visual introduction, the [project-card image](docs/figures/local-fft-card.png) pairs an enlarged Candidate 5 photograph with its corresponding FFT. It is composed specifically for small displays, with two large panels and minimal text; the three-panel figure above explains the full analysis. [Preview the card at 400 pixels wide](docs/figures/local-fft-card-preview.png).
+
 ## What It Helps Explain
 
 This tool can help you answer questions like:

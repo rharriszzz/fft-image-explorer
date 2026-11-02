@@ -110,6 +110,62 @@ def triptych(d, points, rgb, out):
     fig.text(.125,.065,'Repeated bead spacing produces paired off-center peaks.\nColor contrast changes their strength; orientation changes their direction.',fontsize=13,color=INK)
     fig.savefig(out,dpi=120);plt.close(fig)
 
+def card_figure(d, points, photo_fraction=.48, photo_half_width=90):
+    """Compose a 1600×1000 card directly from Candidate 5 data, without FFT rotation.
+
+    Rectangular views keep equal data aspect: cropping never stretches the image.
+    The optional layout arguments are for visual review, not numerical analysis.
+    """
+    if d['index'] != 5:
+        raise ValueError('The project card is fixed to the owner-selected Candidate 5')
+    fig = plt.figure(figsize=(16, 10), dpi=100, facecolor='white')
+    margin, gap, bottom, height = 24, 20, 24, 872
+    usable = 1600 - 2*margin - gap
+    left_width = usable * photo_fraction
+    right_width = usable - left_width
+    left = fig.add_axes([margin/1600, bottom/1000, left_width/1600, height/1000])
+    right_x = margin + left_width + gap
+    right = fig.add_axes([right_x/1600, bottom/1000, right_width/1600, height/1000])
+    source(left, d, points)
+    cx, cy = d['center']
+    photo_half_height = photo_half_width * height / left_width
+    left.set_xlim(cx-photo_half_width, cx+photo_half_width)
+    left.set_ylim(cy+photo_half_height, cy-photo_half_height)
+    for ring in left.patches:
+        ring.set_linewidth(3.4)
+        ring.set_path_effects([pe.Stroke(linewidth=5, foreground=INK), pe.Normal()])
+    left.lines[0].set_alpha(.65)
+    left.lines[0].set_linewidth(.9)
+    left.lines[1].set_markersize(22)
+    left.lines[1].set_markeredgewidth(3.6)
+    left.lines[1].set_path_effects([pe.Stroke(linewidth=5, foreground=INK), pe.Normal()])
+    freq = np.fft.fftshift(np.fft.fftfreq(SIZE))
+    half_bin = .5/SIZE
+    right.imshow(np.log1p(abs(d['spectrum'])), origin='upper', cmap='magma',
+                 vmin=1, vmax=6, interpolation='nearest',
+                 extent=(freq[0]-half_bin, freq[-1]+half_bin,
+                         freq[-1]+half_bin, freq[0]-half_bin))
+    # Same scale and orientation as the scientific figure; tighter view only.
+    fx_limit = .08
+    fy_limit = fx_limit * height / right_width
+    right.set_xlim(-fx_limit, fx_limit)
+    right.set_ylim(fy_limit, -fy_limit)
+    for ax in (left, right):
+        ax.set_axis_off()
+        ax.set_aspect('equal')
+    for x, label in [(margin, 'Gaussian window'), (right_x, '2D Fourier transform')]:
+        fig.text(x/1600, .943, label, fontsize=32, weight='medium',
+                 fontfamily='DejaVu Sans', color=INK, va='center')
+    return fig
+
+
+def save_card(d, points, out):
+    fig = card_figure(d, points)
+    fig.savefig(out/'local-fft-card.png', dpi=100)
+    plt.close(fig)
+    with Image.open(out/'local-fft-card.png') as im:
+        im.resize((400, 250), Image.Resampling.LANCZOS).save(out/'local-fft-card-preview.png')
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,default=ROOT/'docs/figures')
@@ -127,8 +183,10 @@ def main():
     sheet=Image.new('RGB',(thumbs[0].width,thumbs[0].height*3),'white')
     for k,im in enumerate(thumbs):sheet.paste(im,(0,k*im.height))
     sheet.save(out/'local-fft-candidates.png')
-    with Image.open(out/'local-fft-hero.png') as im:
-        im.resize((400,200),Image.Resampling.LANCZOS).save(out/'local-fft-card.png')
+    card_data = next((d for d in data if d['index'] == 5), None)
+    if card_data is None:
+        card_data = compute(rgb, y, points, 5)
+    save_card(card_data, points, out)
     fig,axes=plt.subplots(3,3,figsize=(13,13),gridspec_kw={'width_ratios':[1,1,1.1]})
     for row,d in zip(axes,data):
         source(row[0],d,points);row[0].set_title(f'Centerline #{d["index"]} · spatial window',loc='left')

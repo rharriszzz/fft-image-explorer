@@ -1,7 +1,11 @@
 import json
 import unittest
+import tempfile
+from pathlib import Path
+from PIL import Image
+import matplotlib.pyplot as plt
 import numpy as np
-from scripts.generate_fft_figures import ROOT, SIZE, SIGMA, INDICES, compute
+from scripts.generate_fft_figures import ROOT, SIZE, SIGMA, INDICES, compute, card_figure, save_card
 from map_from_fft import load_image_and_luminance, make_gaussian_window
 from fft_image_explorer import make_mask
 
@@ -54,6 +58,43 @@ class FigureNumerics(unittest.TestCase):
                 self.assertAlmostEqual(p['magnitude'],float(mag[row,col]),delta=5e-5)
                 self.assertGreaterEqual(mag[row,col]+1e-4,mag[row-1:row+2,col-1:col+2].max())
                 self.assertAlmostEqual(p['ft']**2+p['fn']**2,p['fx']**2+p['fy']**2)
+
+    def test_card_uses_candidate_five_data_without_distortion(self):
+        d = self.data[0]
+        original_fft = d['spectrum'].copy()
+        fig = card_figure(d, self.points)
+        try:
+            fig.canvas.draw()
+            photo, spectrum = fig.axes
+            np.testing.assert_array_equal(photo.images[0].get_array(), d['patch'])
+            np.testing.assert_array_equal(spectrum.images[0].get_array(),
+                                          np.log1p(abs(original_fft)))
+            self.assertEqual(spectrum.images[0].get_clim(), (1, 6))
+            for ax in fig.axes:
+                # Equal screen scale per data unit, despite rectangular panels.
+                transform = ax.transData
+                zero = transform.transform((0, 0))
+                dx = np.linalg.norm(transform.transform((1, 0))-zero)
+                dy = np.linalg.norm(transform.transform((0, 1))-zero)
+                self.assertAlmostEqual(dx, dy)
+            for ring, radius in zip(photo.patches, [SIGMA, 2*SIGMA]):
+                np.testing.assert_array_equal(ring.center, d['center'])
+                self.assertEqual(ring.radius, radius)
+            np.testing.assert_array_equal(d['spectrum'], original_fft)
+        finally:
+            plt.close(fig)
+        with self.assertRaises(ValueError):
+            card_figure(self.data[1], self.points)
+
+    def test_card_outputs_and_uniform_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            save_card(self.data[0], self.points, out)
+            with Image.open(out/'local-fft-card.png') as full, Image.open(out/'local-fft-card-preview.png') as preview:
+                self.assertEqual(full.size, (1600, 1000))
+                self.assertEqual(preview.size, (400, 250))
+                np.testing.assert_array_equal(preview,
+                    full.resize((400, 250), Image.Resampling.LANCZOS))
 
     def test_frequency_orientation_with_known_mode(self):
         yy,xx=np.indices((SIZE,SIZE))

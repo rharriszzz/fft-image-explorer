@@ -11,7 +11,19 @@ python3 scripts/generate_fft_figures.py
 python3 -m unittest discover -s tests -v
 ```
 
-The generator resolves inputs relative to its own repository, never the historical absolute paths in the JSON. Missing inputs fail. `--output /tmp/fft-figures` writes elsewhere; `--indices 5 80 280` explicitly selects the three zero-based spline indices, with the first becoming the hero. Outputs include three individual candidates, a contact sheet, hero, comparison, 400-pixel card preview and `measurements.json` with source SHA256 and peak coordinates/amplitudes. Reference environment: Python 3.14.4, NumPy 2.3.5, Matplotlib 3.10.7, Pillow 12.1.1. PNG rendering may vary with library/font versions; the numerical recipe is fixed.
+The generator resolves inputs relative to its own repository, never the historical absolute paths in the JSON. Missing inputs fail. `--output /tmp/fft-figures` writes elsewhere; `--indices 5 80 280` explicitly selects the three zero-based spline indices, with the first becoming the hero. Outputs include three individual candidates, a contact sheet, hero, comparison, a dedicated 1600 × 1000 project card, its 400 × 250 preview and `measurements.json` with source SHA256 and peak coordinates/amplitudes. Reference environment: Python 3.14.4, NumPy 2.3.5, Matplotlib 3.10.7, Pillow 12.1.1. PNG rendering may vary with library/font versions; the numerical recipe is fixed.
+
+## Project card
+
+[Full-resolution card](figures/local-fft-card.png) · [400-pixel preview](figures/local-fft-card-preview.png)
+
+The owner selected Candidate 5. The card is a separate two-panel composition of its original photograph and actual Gaussian-windowed luminance FFT, generated directly from the same calculation as the three-panel hero. It is always fixed to index 5, even when `--indices` selects different candidates for the supporting figures. Run the regeneration command above to recreate both card files.
+
+The 1600 × 1000 PNG has a white background, 24-pixel outer margins, a 20-pixel panel gap and just two labels. The photograph takes 48% of the available panel width and the FFT 52%. The photograph is centered on the exact saved point, cropped to ±90 source pixels horizontally; its vertical span follows the panel aspect ratio. Both 1σ (solid) and 2σ (dashed) contours fit, with a white cross at the selected point and a subtle centerline. The same faint Gaussian weighting overlay as the hero is retained. All Gaussian and FFT parameters are unchanged.
+
+The FFT view is cropped to ±0.08 cycles/pixel horizontally; its vertical range is ±(0.08 × panel height / panel width). Equal data aspect preserves geometry in both panels. Frequency y still points down; the FFT is neither rotated nor stretched. The log display and saturation limits remain `ln(1 + |FFT|)` in [1,6], exactly as in the hero. No axes, direction arrows, peak markers or colorbar are included in this introductory card; the full figure supplies scientific context. DC remains present and display-saturated. Visible square FFT bins and limited photographic sharpness at full resolution reflect the original data rather than added smoothing or invented detail.
+
+Four layouts were inspected at 400 × 250: equal panels, a larger FFT, a larger photograph, and the selected near-equal layout with a tighter photo crop. The selected layout keeps beads recognizable and both contours visible while giving the spectrum slightly more room. The final preview is a uniform Lanczos reduction of the dedicated card, not of the hero; the labels remain readable at this size. Layout alternatives are not published in the README. This is a visual introduction, not an illustration for precise angle measurement or geometric reconstruction.
 
 ## Selection and interpretation
 
@@ -23,7 +35,7 @@ An initial visual survey examined indices 5, 20, 45, 80, 105, 145, 160, 190, 210
 | 80 | 955.460449, 2606.994141 | Lower left, yellow and red around the center with black separators; more curvature and stronger leading peak, but less clean separation. |
 | 280 | 2151.359619, 973.794067 | Upper right, predominantly red/black near the center with yellow farther out; extra low-frequency structure. |
 
-Candidate 5 is selected for clarity and balance, not maximum peak magnitude: candidate 80's leading peak is stronger. At 400 pixels wide, the marked location, circular window and spectral structure remain visible; detailed labels require enlargement. The photo panel spans 270 pixels while the scalar panel shows all 401 input pixels; their display magnifications deliberately differ.
+Candidate 5 is selected for clarity and balance, not maximum peak magnitude: candidate 80's leading peak is stronger. The three-panel figure is intended for the README at larger sizes; the dedicated card below replaces its former 400-pixel thumbnail. The photo panel spans 270 pixels while the scalar panel shows all 401 input pixels; their display magnifications deliberately differ.
 
 In tangent/normal coordinates, a roughly near-tangent feature has `(ft, fn)` of `(0.0478, −0.0044)`, `(0.0434, −0.0101)` and `(0.0450, −0.0087)` cycles/pixel respectively. Its amplitudes are 262, 225 and 278, and its angles relative to the tangent are −5.3°, −13.1° and −10.9°. Two oblique families lie approximately at +42° to +49° and −49° to −61°. These are descriptive correspondences, not a fitted lattice assignment. Their ranks change. Candidate 280 also has a strong lower-frequency pair near `(0.0102, 0.0123)` without an equally strong counterpart in the other two top-four lists. Thus orientation correction reveals approximate similarity, not identical spectra.
 
