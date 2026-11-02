@@ -4,6 +4,12 @@ Interactive 2D FFT explorer for color images.
 
 This project shows an image in both the spatial and frequency domains so you can see how masks, soft edges, and frequency filters change what remains. It is especially useful for comparing smooth background regions against texture, repeating patterns, and edge-heavy foreground objects.
 
+![Local photograph, Gaussian-weighted luminance and its computed 2D FFT](docs/figures/local-fft-hero.png)
+
+On the right side of the necklace (saved centerline point 5), the cyan circles mark one and two standard deviations of a **spatial Gaussian window**. The middle panel shows the actual scalar luminance input multiplied by that window; the right panel shows its computed 2D Fourier magnitude on a logarithmic scale. Repeated bead spacings produce recognizable off-center peak pairs and directional structure. This is a generated scientific figure from the original photograph, not an application screenshot.
+
+[Generation details and numerical conventions](docs/fft-figures.md) · [Three candidate figures](docs/figures/local-fft-candidates.png)
+
 ## What It Helps Explain
 
 This tool can help you answer questions like:
@@ -20,6 +26,14 @@ This tool can help you answer questions like:
 - choose and tune a spatial mask or window
 - inspect the masked input, the log-magnitude FFT, and the inverse FFT
 - interactively explore high-pass, low-pass, and threshold-based filtering
+
+## Comparing local geometry
+
+![Three necklace regions and their FFTs, with peaks projected onto local tangent and normal coordinates](docs/figures/local-fft-comparison.png)
+
+These regions contain different mixtures of yellow, red and black beads. Each FFT receives **one luminance value per pixel**, not separately classified colors. The same channel, Gaussian size and display scale are used throughout. Local orientation rotates the frequency pattern; the right column expresses selected peaks relative to the centerline tangent and normal without rotating the FFT images.
+
+Several peak directions and spacings are approximately similar after accounting for orientation, while their relative strengths change. The red/black region also has an additional prominent low-frequency pair. Color contrast, lighting and projection matter: a stronger peak alone does not mean the bead geometry is more regular. See the [measurements and limitations](docs/fft-figures.md) for the quantitative comparison.
 
 ## Project Files
 
